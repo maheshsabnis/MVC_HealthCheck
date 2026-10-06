@@ -1,0 +1,95 @@
+@model ProcessedOrdersViewModel
+@{
+    ViewData["Title"] = "Accepted and Rejected Orders";
+    var accepted = Model.ProcessedOrders.Where(p => p.IsAccepted).ToList();
+    var rejected = Model.ProcessedOrders.Where(p => !p.IsAccepted).ToList();
+}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h1 class="h3 mb-0">Accepted and Rejected Orders</h1>
+    <a class="btn btn-sm btn-outline-secondary" asp-action="Decisions" asp-route-decision="@Model.Decision">Refresh</a>
+</div>
+
+@if (Model.DataError is not null)
+{
+    <div class="alert alert-danger">
+        <strong>PostgreSQL could not be read.</strong>
+        <div class="small mt-1">@Model.DataError</div>
+    </div>
+}
+
+<div class="mb-3">
+    <a class="btn btn-sm @(Model.Decision is null ? "btn-dark" : "btn-outline-dark")"
+       asp-action="Decisions">All (@(Model.AcceptedCount + Model.RejectedCount))</a>
+    <a class="btn btn-sm @(Model.Decision == "Accepted" ? "btn-success" : "btn-outline-success")"
+       asp-action="Decisions" asp-route-decision="Accepted">Accepted (@Model.AcceptedCount)</a>
+    <a class="btn btn-sm @(Model.Decision == "Rejected" ? "btn-danger" : "btn-outline-danger")"
+       asp-action="Decisions" asp-route-decision="Rejected">Rejected (@Model.RejectedCount)</a>
+</div>
+
+<div class="alert alert-light border small">
+    Rule applied by the background service: an order is <strong>Accepted</strong> when the advance
+    is at least <strong>50%</strong> of the order total, otherwise it is <strong>Rejected</strong>.
+</div>
+
+@{
+    // Local helper so both panels render identically.
+    async Task RenderPanel(string title, string colour, IReadOnlyList<ProcessedOrder> rows, decimal value)
+    {
+        <div class="card h-100">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <span class="fw-semibold text-@colour">@title</span>
+                <span class="badge bg-@colour">@rows.Count &middot; @value.ToString("N2")</span>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-sm table-striped mb-0 align-middle">
+                    <thead>
+                        <tr>
+                            <th>Order #</th>
+                            <th>Customer</th>
+                            <th class="text-end">Total</th>
+                            <th class="text-end">Advance</th>
+                            <th class="text-end">%</th>
+                            <th>Processed (UTC)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @if (rows.Count == 0)
+                        {
+                            <tr><td colspan="6" class="text-center text-muted py-3">None.</td></tr>
+                        }
+                        @foreach (var p in rows)
+                        {
+                            <tr>
+                                <td class="font-monospace">
+                                    <a asp-action="Details" asp-route-id="@p.OrderId">@p.OrderNumber</a>
+                                </td>
+                                <td>@p.CustomerName</td>
+                                <td class="text-end">@p.TotalAmount.ToString("N2")</td>
+                                <td class="text-end">@p.AdvanceAmount.ToString("N2")</td>
+                                <td class="text-end text-@colour">@p.AdvancePercentage.ToString("0.##")</td>
+                                <td class="small">@p.ProcessedOnUtc.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </div>
+        await Task.CompletedTask;
+    }
+}
+
+<div class="row g-4">
+    @if (Model.Decision is null or "Accepted")
+    {
+        <div class="col-12 @(Model.Decision is null ? "col-xl-6" : "")">
+            @{ await RenderPanel("Accepted", "success", accepted, accepted.Sum(p => p.TotalAmount)); }
+        </div>
+    }
+    @if (Model.Decision is null or "Rejected")
+    {
+        <div class="col-12 @(Model.Decision is null ? "col-xl-6" : "")">
+            @{ await RenderPanel("Rejected", "danger", rejected, rejected.Sum(p => p.TotalAmount)); }
+        </div>
+    }
+</div>

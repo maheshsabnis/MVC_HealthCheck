@@ -1,0 +1,104 @@
+@model ProcessedOrdersViewModel
+@{
+    ViewData["Title"] = "Processed Orders";
+}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h1 class="h3 mb-0">Processed Orders <span class="text-muted fs-6">(PostgreSQL)</span></h1>
+    <a class="btn btn-sm btn-outline-secondary" asp-action="Processed">Refresh</a>
+</div>
+
+@if (Model.DataError is not null)
+{
+    <div class="alert alert-danger">
+        <strong>PostgreSQL could not be read.</strong>
+        <div class="small mt-1">@Model.DataError</div>
+        <div class="small mt-1">Check <a href="/health" target="_blank" rel="noopener">/health</a> for the current state.</div>
+    </div>
+}
+
+<div class="row g-3 mb-4">
+    <div class="col-6 col-lg-3">
+        <div class="card text-bg-success h-100"><div class="card-body">
+            <div class="small text-uppercase">Accepted</div>
+            <div class="fs-3">@Model.AcceptedCount</div>
+            <div class="small">@Model.AcceptedValue.ToString("N2") value</div>
+        </div></div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="card text-bg-danger h-100"><div class="card-body">
+            <div class="small text-uppercase">Rejected</div>
+            <div class="fs-3">@Model.RejectedCount</div>
+            <div class="small">@Model.RejectedValue.ToString("N2") value</div>
+        </div></div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="card h-100"><div class="card-body">
+            <div class="small text-uppercase text-muted">Total Processed</div>
+            <div class="fs-3">@(Model.AcceptedCount + Model.RejectedCount)</div>
+        </div></div>
+    </div>
+    <div class="col-6 col-lg-3">
+        <div class="card h-100"><div class="card-body">
+            <div class="small text-uppercase text-muted">Acceptance Rate</div>
+            <div class="fs-3">
+                @{
+                    var totalDecided = Model.AcceptedCount + Model.RejectedCount;
+                    var rate = totalDecided == 0 ? 0m : (decimal)Model.AcceptedCount / totalDecided * 100m;
+                }
+                @rate.ToString("0.#")%
+            </div>
+        </div></div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header fw-semibold">processed_orders</div>
+    <div class="table-responsive">
+        <table class="table table-striped table-hover mb-0 align-middle">
+            <thead>
+                <tr>
+                    <th>Order #</th>
+                    <th>Customer</th>
+                    <th class="text-center">Items</th>
+                    <th class="text-end">Total</th>
+                    <th class="text-end">Advance</th>
+                    <th class="text-end">Advance %</th>
+                    <th>Decision</th>
+                    <th>Reason</th>
+                    <th>Processed (UTC)</th>
+                    <th class="text-end">Took</th>
+                </tr>
+            </thead>
+            <tbody>
+                @if (Model.ProcessedOrders.Count == 0)
+                {
+                    <tr>
+                        <td colspan="10" class="text-center text-muted py-4">
+                            Nothing has been processed yet. Create an order and give the worker a moment.
+                        </td>
+                    </tr>
+                }
+                @foreach (var p in Model.ProcessedOrders)
+                {
+                    <tr>
+                        <td class="font-monospace">
+                            <a asp-action="Details" asp-route-id="@p.OrderId">@p.OrderNumber</a>
+                        </td>
+                        <td>@p.CustomerName</td>
+                        <td class="text-center">@p.ItemCount</td>
+                        <td class="text-end">@p.TotalAmount.ToString("N2")</td>
+                        <td class="text-end">@p.AdvanceAmount.ToString("N2")</td>
+                        <td class="text-end @(p.IsAccepted ? "text-success" : "text-danger")">
+                            @p.AdvancePercentage.ToString("0.##")%
+                        </td>
+                        <td><span class="badge bg-@(p.IsAccepted ? "success" : "danger")">@p.Decision</span></td>
+                        <td class="small text-muted">@p.Reason</td>
+                        <td class="small">@p.ProcessedOnUtc.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                        <td class="text-end small">@p.ProcessingDurationMs ms</td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+</div>

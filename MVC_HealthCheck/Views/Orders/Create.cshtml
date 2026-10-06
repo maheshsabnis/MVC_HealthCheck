@@ -1,0 +1,196 @@
+@model CreateOrderViewModel
+@{
+    ViewData["Title"] = "Create Order";
+}
+
+<h1 class="h3 mb-3">Create Order</h1>
+
+<div asp-validation-summary="All" class="text-danger mb-3"></div>
+
+<form asp-action="Create" method="post" id="orderForm">
+    @Html.AntiForgeryToken()
+
+    <div class="row g-4">
+        <div class="col-12 col-lg-8">
+            <div class="card mb-3">
+                <div class="card-header fw-semibold">Customer</div>
+                <div class="card-body">
+                    <label asp-for="CustomerId" class="form-label"></label>
+                    <select asp-for="CustomerId" asp-items="Model.CustomerOptions" class="form-select">
+                        <option value="">-- choose a customer --</option>
+                    </select>
+                    <span asp-validation-for="CustomerId" class="text-danger small"></span>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <span class="fw-semibold">Products</span>
+                    <button type="button" class="btn btn-sm btn-outline-primary" id="addLine">Add line</button>
+                </div>
+                <div class="table-responsive">
+                    <table class="table mb-0 align-middle" id="linesTable">
+                        <thead>
+                            <tr>
+                                <th style="width:50%">Product</th>
+                                <th style="width:15%">Qty</th>
+                                <th style="width:15%" class="text-end">Unit Price</th>
+                                <th style="width:15%" class="text-end">Line Total</th>
+                                <th style="width:5%"></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @for (var i = 0; i < Model.Items.Count; i++)
+                            {
+                                <tr class="order-line">
+                                    <td>
+                                        <select name="Items[@i].ProductId" class="form-select product-select">
+                                            <option value="0" data-price="0">-- choose a product --</option>
+                                            @foreach (var p in Model.Products)
+                                            {
+                                                <option value="@p.Id" data-price="@p.UnitPrice.ToString(System.Globalization.CultureInfo.InvariantCulture)"
+                                                        selected="@(Model.Items[i].ProductId == p.Id)">
+                                                    @p.Name (@p.Sku)
+                                                </option>
+                                            }
+                                        </select>
+                                    </td>
+                                    <td>
+                                        <input name="Items[@i].Quantity" type="number" min="1" step="1"
+                                               value="@Model.Items[i].Quantity" class="form-control qty-input" />
+                                    </td>
+                                    <td class="text-end unit-price">0.00</td>
+                                    <td class="text-end line-total">0.00</td>
+                                    <td class="text-end">
+                                        <button type="button" class="btn btn-sm btn-outline-danger remove-line">&times;</button>
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="col-12 col-lg-4">
+            <div class="card">
+                <div class="card-header fw-semibold">Payment</div>
+                <div class="card-body">
+                    <dl class="row mb-3">
+                        <dt class="col-6">Order Total</dt>
+                        <dd class="col-6 text-end fs-5" id="orderTotal">0.00</dd>
+                    </dl>
+
+                    <label asp-for="AdvanceAmount" class="form-label"></label>
+                    <input asp-for="AdvanceAmount" type="number" step="0.01" min="0" class="form-control" id="advanceInput" />
+                    <span asp-validation-for="AdvanceAmount" class="text-danger small"></span>
+
+                    <div class="mt-3">
+                        <div class="d-flex justify-content-between small">
+                            <span>Advance as % of total</span>
+                            <span id="advancePctLabel">0%</span>
+                        </div>
+                        <div class="progress mt-1" style="height:1.25rem">
+                            <div class="progress-bar" id="advanceBar" role="progressbar" style="width:0%">0%</div>
+                        </div>
+                        <div class="form-text" id="advanceHint">
+                            The background worker accepts an order when the advance is at least 50% of the total.
+                        </div>
+                    </div>
+
+                    <div class="d-grid gap-2 mt-4">
+                        <button type="submit" class="btn btn-primary">Place Order</button>
+                        <a asp-action="Status" class="btn btn-outline-secondary">Cancel</a>
+                    </div>
+                </div>
+            </div>
+
+            <div class="alert alert-light border mt-3 small">
+                The order is written to <strong>SQL Server</strong>, pushed to <strong>RabbitMQ</strong>,
+                picked up by the background worker, and the decision is stored in
+                <strong>PostgreSQL</strong>. Live counts come from <strong>Redis</strong>.
+            </div>
+        </div>
+    </div>
+</form>
+
+@section Scripts {
+    <partial name="_ValidationScriptsPartial" />
+    <script>
+        (function () {
+            const table = document.querySelector('#linesTable tbody');
+            const totalEl = document.getElementById('orderTotal');
+            const advanceInput = document.getElementById('advanceInput');
+            const advanceBar = document.getElementById('advanceBar');
+            const advancePctLabel = document.getElementById('advancePctLabel');
+            const advanceHint = document.getElementById('advanceHint');
+
+            // Indexes must stay contiguous or the MVC model binder stops at the first gap.
+            function reindex() {
+                table.querySelectorAll('tr.order-line').forEach(function (row, i) {
+                    const select = row.querySelector('.product-select');
+                    const qty = row.querySelector('.qty-input');
+                    select.name = 'Items[' + i + '].ProductId';
+                    qty.name = 'Items[' + i + '].Quantity';
+                });
+            }
+
+            function recalc() {
+                let total = 0;
+                table.querySelectorAll('tr.order-line').forEach(function (row) {
+                    const select = row.querySelector('.product-select');
+                    const qty = parseInt(row.querySelector('.qty-input').value, 10) || 0;
+                    const price = parseFloat(select.options[select.selectedIndex].dataset.price) || 0;
+                    const line = price * qty;
+                    row.querySelector('.unit-price').textContent = price.toFixed(2);
+                    row.querySelector('.line-total').textContent = line.toFixed(2);
+                    total += line;
+                });
+
+                totalEl.textContent = total.toFixed(2);
+
+                const advance = parseFloat(advanceInput.value) || 0;
+                const pct = total > 0 ? (advance / total) * 100 : 0;
+                const capped = Math.min(pct, 100);
+
+                advancePctLabel.textContent = pct.toFixed(2) + '%';
+                advanceBar.style.width = capped + '%';
+                advanceBar.textContent = pct.toFixed(0) + '%';
+
+                const willAccept = pct >= 50;
+                advanceBar.className = 'progress-bar ' + (willAccept ? 'bg-success' : 'bg-danger');
+                advanceHint.textContent = total <= 0
+                    ? 'Add a product line to see the advance percentage.'
+                    : (willAccept
+                        ? 'This order will be ACCEPTED (advance is at least 50% of the total).'
+                        : 'This order will be REJECTED (advance is below 50% of the total).');
+                advanceHint.className = 'form-text ' + (total <= 0 ? '' : (willAccept ? 'text-success' : 'text-danger'));
+            }
+
+            table.addEventListener('change', recalc);
+            table.addEventListener('input', recalc);
+            advanceInput.addEventListener('input', recalc);
+
+            document.getElementById('addLine').addEventListener('click', function () {
+                const first = table.querySelector('tr.order-line');
+                const clone = first.cloneNode(true);
+                clone.querySelector('.product-select').selectedIndex = 0;
+                clone.querySelector('.qty-input').value = 1;
+                table.appendChild(clone);
+                reindex();
+                recalc();
+            });
+
+            table.addEventListener('click', function (e) {
+                if (!e.target.classList.contains('remove-line')) return;
+                const rows = table.querySelectorAll('tr.order-line');
+                if (rows.length === 1) return; // always keep one line
+                e.target.closest('tr').remove();
+                reindex();
+                recalc();
+            });
+
+            recalc();
+        })();
+    </script>
+}

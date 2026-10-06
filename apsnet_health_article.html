@@ -1,0 +1,3646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Health Checks in ASP.NET Core 10</title>
+<style>
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto; padding: 2rem 1rem 5rem; max-width: 60rem;
+  font: 16px/1.65 Georgia, "Times New Roman", serif;
+  color: #1b1f27; background: #fff;
+}
+h1 { font-size: 2rem; line-height: 1.25; margin: 0 0 .4rem; }
+h2 { font-size: 1.45rem; margin: 2.6rem 0 .8rem; padding-bottom: .3rem; border-bottom: 2px solid #d9dee6; }
+h3 { font-size: 1.15rem; margin: 2rem 0 .6rem; font-family: Consolas, "Courier New", monospace; color: #11324f; }
+h4 { font-size: 1.02rem; margin: 1.5rem 0 .4rem; }
+p, li { margin: .7rem 0; }
+code { font-family: Consolas, "Courier New", monospace; font-size: .88em; }
+pre.code { font-family: Consolas, "Courier New", monospace; font-size: .82rem; line-height: 1.5;
+  margin: 1rem 0; overflow-x: auto; }
+pre.code code { font-size: inherit; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .9rem; }
+th, td { border: 1px solid #d9dee6; padding: .5rem .6rem; text-align: left; vertical-align: top; }
+th { background: #f1f3f6; }
+blockquote { margin: 1.2rem 0; padding: .6rem 1rem; border-left: 3px solid #c6ccd6; background: #f8f9fb; }
+.lede { font-size: 1.08rem; color: #3d4654; }
+hr { border: 0; border-top: 1px solid #d9dee6; margin: 2.5rem 0; }
+@media (prefers-color-scheme: dark) {
+  body { background: #14171c; color: #dde2ea; }
+  h3 { color: #8fb6dd; }
+  th { background: #232830; }
+  th, td { border-color: #2d343e; }
+  blockquote { background: #1b1f26; border-left-color: #39414f; }
+  h2 { border-bottom-color: #2d343e; }
+  .lede { color: #aab4c2; }
+}
+</style>
+</head>
+<body>
+
+<h1>Health Checks in ASP.NET Core 10: Monitoring SQL Server, PostgreSQL, Redis and RabbitMQ in a Real Pipeline</h1>
+
+<p class="lede">Most health check tutorials stop at returning the word "Healthy" from an empty
+project. That teaches the syntax and none of the judgement. This article wires
+<code>AspNetCore.Diagnostics.HealthChecks</code> into an order processing application that
+genuinely depends on four external systems, and shows what each probe is actually telling
+you.</p>
+
+<p>The application captures an order in SQL Server, publishes it to RabbitMQ, processes it in a
+background service, writes the decision to PostgreSQL, and uses Redis to show live activity. Every
+one of those four dependencies can fail independently, which is exactly what makes it a useful
+subject. We will build it from the first model class to the last line of
+<code>Program.cs</code>.</p>
+
+<h2>1. What is a health check in ASP.NET Core, and why does it matter?</h2>
+
+<p>A health check is an endpoint your application exposes that answers one question: can I
+currently do my job? Not "is the process running", which the operating system already knows, but
+"are the things I depend on reachable and responding".</p>
+
+<p>The distinction matters because a web application can be perfectly alive and completely
+useless. The process is up, Kestrel is accepting connections, and every request returns a 500
+because the database refused the connection. From the outside, a plain TCP check sees a healthy
+port. A health check sees the truth.</p>
+
+<p>ASP.NET Core ships this as a first class feature in
+<code>Microsoft.Extensions.Diagnostics.HealthChecks</code>, with no extra package needed for the
+infrastructure itself. You register checks with <code>AddHealthChecks()</code> and expose them
+with <code>MapHealthChecks()</code>. Each check reports one of three states:</p>
+
+<ul>
+<li><strong>Healthy.</strong> Working normally.</li>
+<li><strong>Degraded.</strong> Working, but not well. Slow, or a non essential dependency is
+missing. The endpoint still returns 200 by default, because you usually do not want a load
+balancer pulling the instance out of rotation over a degraded cache.</li>
+<li><strong>Unhealthy.</strong> Not working. Returns 503 by default.</li>
+</ul>
+
+<p>The aggregate status of the application is the worst status among its checks. One unhealthy
+database makes the whole report unhealthy.</p>
+
+<h4>Why it matters in practice</h4>
+
+<p>Three concrete uses justify the work.</p>
+
+<p><strong>Orchestrators use it to make decisions.</strong> Kubernetes distinguishes liveness from
+readiness. A failing liveness probe restarts the container; a failing readiness probe stops
+traffic being routed to it while leaving it running. That is why this article exposes them
+separately. Restarting a container because PostgreSQL is briefly unreachable helps nobody, and a
+restart loop during a database blip turns a small incident into an outage.</p>
+
+<p><strong>Load balancers use it to route.</strong> An instance that cannot reach its database
+should stop receiving requests until it can.</p>
+
+<p><strong>Humans use it to diagnose.</strong> This is the one that gets underrated. When a
+deployment misbehaves at two in the morning, a single endpoint that names which of four
+dependencies is refusing connections, and how long each took to respond, turns a half hour of
+guessing into a glance. That is why this article replaces the default plain text body with JSON
+that names every check.</p>
+
+<blockquote>
+<p>A health check should test reachability, not correctness. Run <code>SELECT 1</code>, not a
+report query. A probe that is expensive will be called every few seconds by every orchestrator
+and load balancer in the system, and an expensive probe under load becomes the thing that takes
+you down.</p>
+</blockquote>
+
+<h2>2. The packages, and the classes that matter</h2>
+
+<p>The built in feature gives you the plumbing but no probes. Writing a check for SQL Server by
+hand is not hard, but writing one for every dependency, correctly, is a lot of repeated work.
+<code>AspNetCore.Diagnostics.HealthChecks</code> is a widely used open source project (published
+by Xabaril) providing ready made probes for most things you would depend on. The packages are
+independent, so you install only what you need.</p>
+
+<table>
+<thead><tr><th>Package</th><th>Version</th><th>What it provides</th></tr></thead>
+<tbody>
+<tr><td><code>AspNetCore.HealthChecks.SqlServer</code></td><td>9.0.0</td><td><code>AddSqlServer()</code>. Opens a connection and runs a probe query against SQL Server.</td></tr>
+<tr><td><code>AspNetCore.HealthChecks.NpgSql</code></td><td>9.0.0</td><td><code>AddNpgSql()</code>. The same idea for PostgreSQL, through Npgsql.</td></tr>
+<tr><td><code>AspNetCore.HealthChecks.Redis</code></td><td>9.0.0</td><td><code>AddRedis()</code>. Pings Redis, either from a connection string or from a multiplexer you already own.</td></tr>
+<tr><td><code>AspNetCore.HealthChecks.Rabbitmq</code></td><td>9.0.0</td><td><code>AddRabbitMQ()</code>. Opens a channel on a RabbitMQ connection supplied by a factory delegate.</td></tr>
+<tr><td><code>AspNetCore.HealthChecks.UI</code></td><td>9.0.0</td><td><code>AddHealthChecksUI()</code> and <code>MapHealthChecksUI()</code>. The polling dashboard.</td></tr>
+<tr><td><code>AspNetCore.HealthChecks.UI.Client</code></td><td>9.0.0</td><td><code>UIResponseWriter</code>. Writes the JSON shape the dashboard understands.</td></tr>
+<tr><td><code>AspNetCore.HealthChecks.UI.InMemory.Storage</code></td><td>9.0.0</td><td><code>AddInMemoryStorage()</code>. Keeps the dashboard's check history in memory.</td></tr>
+</tbody>
+</table>
+
+<p>Install them alongside the data access libraries:</p>
+
+<pre class="code" data-lang="bash"><code>dotnet add package Microsoft.EntityFrameworkCore.SqlServer
+dotnet add package Npgsql.EntityFrameworkCore.PostgreSQL
+dotnet add package Microsoft.EntityFrameworkCore.InMemory
+dotnet add package StackExchange.Redis
+dotnet add package RabbitMQ.Client
+
+dotnet add package AspNetCore.HealthChecks.SqlServer
+dotnet add package AspNetCore.HealthChecks.NpgSql
+dotnet add package AspNetCore.HealthChecks.Redis
+dotnet add package AspNetCore.HealthChecks.Rabbitmq
+dotnet add package AspNetCore.HealthChecks.UI
+dotnet add package AspNetCore.HealthChecks.UI.Client
+dotnet add package AspNetCore.HealthChecks.UI.InMemory.Storage</code></pre>
+
+<blockquote>
+<p><strong>Two compatibility notes from building this on .NET 10.</strong> First,
+<code>AspNetCore.HealthChecks.UI.InMemory.Storage</code> 9.0.0 resolves EF Core 8's InMemory
+provider, which calls a method that no longer exists in EF Core 10 and crashes at startup with
+<code>MissingMethodException</code>. Referencing
+<code>Microsoft.EntityFrameworkCore.InMemory</code> 10.x explicitly fixes it, which is why it
+appears in the list above. Second,
+<code>AspNetCore.HealthChecks.UI</code> 9.0.0 pulls in <code>KubernetesClient</code> 15.0.1,
+which carries a moderate severity advisory and surfaces as an NU1902 warning on every build. The
+<code>/health</code> endpoints do not depend on the UI packages, so you can drop all three UI
+packages if you would rather not carry it.</p>
+</blockquote>
+
+<h4>The important classes</h4>
+
+<table>
+<thead><tr><th>Type</th><th>Role</th></tr></thead>
+<tbody>
+<tr><td><code>IHealthCheck</code></td><td>The interface behind every check. One method, <code>CheckHealthAsync</code>, returning a <code>HealthCheckResult</code>. You implement this only when you write a custom check; the packages above implement it for you.</td></tr>
+<tr><td><code>HealthCheckResult</code></td><td>The result of one check: <code>Healthy</code>, <code>Degraded</code> or <code>Unhealthy</code>, with an optional description, exception and data dictionary.</td></tr>
+<tr><td><code>HealthStatus</code></td><td>The three value enum. Ordered worst to best, which is how the aggregate status is computed.</td></tr>
+<tr><td><code>IHealthChecksBuilder</code></td><td>What <code>AddHealthChecks()</code> returns. Every <code>Add*</code> extension method in the table above hangs off this, which is why registrations chain.</td></tr>
+<tr><td><code>HealthCheckRegistration</code></td><td>One registered check: its name, factory, failure status, tags and timeout. The <code>Predicate</code> on an endpoint filters over these.</td></tr>
+<tr><td><code>HealthCheckService</code></td><td>The service that actually runs the checks. Resolve it from DI to run checks from your own code, which is what the dashboard controller does.</td></tr>
+<tr><td><code>HealthReport</code></td><td>The aggregate result: an overall <code>Status</code>, a <code>TotalDuration</code> and an <code>Entries</code> dictionary.</td></tr>
+<tr><td><code>HealthReportEntry</code></td><td>One entry in that dictionary: status, description, duration, tags, exception and data.</td></tr>
+<tr><td><code>HealthCheckOptions</code></td><td>The per endpoint options passed to <code>MapHealthChecks</code>. Carries <code>Predicate</code>, <code>ResponseWriter</code> and <code>ResultStatusCodes</code>.</td></tr>
+<tr><td><code>UIResponseWriter</code></td><td>From the UI.Client package. A ready made <code>ResponseWriter</code> producing the payload the dashboard polls.</td></tr>
+</tbody>
+</table>
+
+<p>In this application we never implement <code>IHealthCheck</code> ourselves, because the four
+packages cover every dependency. We do use <code>HealthReport</code> and
+<code>HealthReportEntry</code> directly in two places: the custom response writer, and the
+dashboard view.</p>
+
+<h2>3. Running Redis and RabbitMQ in Docker</h2>
+
+<p>SQL Server and PostgreSQL run as local installations in this setup. Redis and RabbitMQ run as
+containers, which is the quickest way to get both.</p>
+
+<p>Pull the images first. This step is optional, since <code>docker run</code> pulls
+automatically when the image is not present locally, but doing it explicitly separates a slow
+download from a failed startup:</p>
+
+<pre class="code" data-lang="bash"><code>docker pull redis:7-alpine
+docker pull rabbitmq:3-management</code></pre>
+
+<p>Then start them:</p>
+
+<pre class="code" data-lang="bash"><code>docker run -d --name hc-redis -p 6379:6379 redis:7-alpine
+
+docker run -d --name hc-rabbitmq -p 5672:5672 -p 15672:15672 ^
+  -e RABBITMQ_DEFAULT_USER=guest ^
+  -e RABBITMQ_DEFAULT_PASS=guest ^
+  rabbitmq:3-management</code></pre>
+
+<p>On PowerShell or bash use a backtick or a backslash for line continuation instead of the caret,
+or simply put the command on one line.</p>
+
+<p>Reading the RabbitMQ flags: <code>-d</code> runs detached, <code>--name</code> gives the
+container a stable name so you can stop and start it by name, and <code>-p host:container</code>
+publishes a port. Two ports are published because RabbitMQ serves two things. Port 5672 is the
+AMQP protocol port your application connects to. Port 15672 is the management web UI, which is
+only present because the image tag is <code>3-management</code> rather than plain
+<code>3</code>. The plain image has no dashboard.</p>
+
+<p>Verify both are up:</p>
+
+<pre class="code" data-lang="bash"><code>docker ps --format &quot;table {{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}&quot;
+
+# Redis should answer PONG
+docker exec hc-redis redis-cli ping
+
+# Inspect the Redis keys this application writes
+docker exec hc-redis redis-cli KEYS &quot;orders:*&quot;
+docker exec hc-redis redis-cli LRANGE orders:list:processed 0 4</code></pre>
+
+<p>The RabbitMQ management UI is at <code>http://localhost:15672</code>, username
+<code>guest</code>, password <code>guest</code>. The Queues tab is useful while developing: you can
+watch <code>order-processing-queue</code> fill and drain as the worker consumes.</p>
+
+<p>Stopping and restarting later, without losing the containers:</p>
+
+<pre class="code" data-lang="bash"><code>docker stop hc-redis hc-rabbitmq
+docker start hc-redis hc-rabbitmq
+
+# remove them entirely
+docker rm -f hc-redis hc-rabbitmq</code></pre>
+
+<blockquote>
+<p>Neither container declares a volume here, so data does not survive <code>docker rm</code>.
+That is deliberate for a demo: Redis holds only activity data this application can rebuild, and
+the RabbitMQ queue should be empty in steady state. For anything long lived, mount a volume.</p>
+</blockquote>
+
+<h2>4. Building the application, step by step</h2>
+
+<p>Start from the MVC template, which gives the controllers, views and wwwroot assets:</p>
+
+<pre class="code" data-lang="bash"><code>dotnet new mvc -n MVC_HealthCheck</code></pre>
+
+<p>What follows adds 35 files on top of that template. The order below is dependency
+order, so each file only refers to things already created.</p>
+
+
+<h3 id="step1">Step 1: Create Models\Customer.cs</h3>
+<p>The order pipeline starts with four SQL Server tables, and the first of them is the customer.
+This is a plain entity class. Entity Framework Core infers the table from the
+<code>DbSet</code> name and the primary key from the <code>Id</code> convention, so the only
+thing worth adding by hand is validation and the navigation property back to the orders.</p>
+<p>The <code>[Required]</code> and <code>[StringLength]</code> attributes do double duty. They
+drive client side and server side validation in the MVC layer, and they also tell EF Core the
+column types to generate, so <code>Name</code> becomes <code>nvarchar(150)</code> rather than
+<code>nvarchar(max)</code>.</p>
+<pre class="code" data-lang="csharp"><code>using System.ComponentModel.DataAnnotations;
+
+namespace MVC_HealthCheck.Models;
+
+/// &lt;summary&gt;SQL Server entity. Placed an order is always tied to exactly one customer.&lt;/summary&gt;
+public class Customer
+{
+    public int Id { get; set; }
+
+    [Required, StringLength(150)]
+    public string Name { get; set; } = string.Empty;
+
+    [Required, EmailAddress, StringLength(200)]
+    public string Email { get; set; } = string.Empty;
+
+    [StringLength(20)]
+    public string? Phone { get; set; }
+
+    [StringLength(100)]
+    public string? City { get; set; }
+
+    public ICollection&lt;Order&gt; Orders { get; set; } = new List&lt;Order&gt;();
+}</code></pre>
+
+
+<h3 id="step2">Step 2: Create Models\Product.cs</h3>
+<p>The product is the catalogue item that order lines point at. Two details matter here.</p>
+<p><code>[Column(TypeName = "decimal(18,2)")]</code> on <code>UnitPrice</code> stops EF Core from
+falling back to its default decimal precision, which would silently truncate or round money. Any
+property that holds currency in this application carries that attribute. The <code>Sku</code>
+gets a unique index later in the <code>DbContext</code>, so the catalogue cannot hold two
+products with the same stock code.</p>
+<pre class="code" data-lang="csharp"><code>using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace MVC_HealthCheck.Models;
+
+/// &lt;summary&gt;SQL Server entity. Catalogue item that order lines point at.&lt;/summary&gt;
+public class Product
+{
+    public int Id { get; set; }
+
+    [Required, StringLength(150)]
+    public string Name { get; set; } = string.Empty;
+
+    [Required, StringLength(50)]
+    public string Sku { get; set; } = string.Empty;
+
+    [Column(TypeName = &quot;decimal(18,2)&quot;)]
+    [Range(0.01, 1_000_000)]
+    public decimal UnitPrice { get; set; }
+
+    [Range(0, int.MaxValue)]
+    public int StockQuantity { get; set; }
+
+    public ICollection&lt;OrderDetail&gt; OrderDetails { get; set; } = new List&lt;OrderDetail&gt;();
+}</code></pre>
+
+
+<h3 id="step3">Step 3: Create Models\OrderStatus.cs</h3>
+<p>This enum is the spine of the whole application. An order walks through these states as it
+moves from the web tier, to the broker, to the background worker, and finally to PostgreSQL.
+Having the states named in one place means the controller, the worker and the views all agree on
+what "in flight" means.</p>
+<p><code>Failed</code> is worth calling out. It is not a business outcome. It means the worker
+could not finish processing because of an infrastructure problem, for example PostgreSQL being
+unreachable. Keeping it separate from <code>Rejected</code> stops an outage from looking like a
+business decision.</p>
+<pre class="code" data-lang="csharp"><code>namespace MVC_HealthCheck.Models;
+
+/// &lt;summary&gt;
+/// Lifecycle of an order as it moves SQL Server -&gt; RabbitMQ -&gt; background worker -&gt; PostgreSQL.
+/// &lt;/summary&gt;
+public enum OrderStatus
+{
+    /// &lt;summary&gt;Persisted to SQL Server but not yet handed to the broker.&lt;/summary&gt;
+    Received = 0,
+
+    /// &lt;summary&gt;Published to RabbitMQ, waiting for the background worker.&lt;/summary&gt;
+    Queued = 1,
+
+    /// &lt;summary&gt;The worker picked the message up and is applying the advance rule.&lt;/summary&gt;
+    Processing = 2,
+
+    /// &lt;summary&gt;Advance was at least 50% of the total. Written to PostgreSQL.&lt;/summary&gt;
+    Accepted = 3,
+
+    /// &lt;summary&gt;Advance was below 50% of the total. Written to PostgreSQL.&lt;/summary&gt;
+    Rejected = 4,
+
+    /// &lt;summary&gt;The worker could not process the message (infrastructure error).&lt;/summary&gt;
+    Failed = 5
+}</code></pre>
+
+
+<h3 id="step4">Step 4: Create Models\Order.cs</h3>
+<p>The order carries the two numbers the business rule compares: <code>TotalAmount</code> and
+<code>AdvanceAmount</code>. Both are written by the server, never taken from the posted form.</p>
+<p><code>AdvancePercentage</code> is marked <code>[NotMapped]</code>, so it is computed in memory
+and never stored. It guards against division by zero by treating a zero total as zero percent.
+The views use this property to colour the advance meter, and the background worker recomputes the
+same figure independently from the queue message.</p>
+<pre class="code" data-lang="csharp"><code>using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace MVC_HealthCheck.Models;
+
+/// &lt;summary&gt;SQL Server entity. The order as captured by the web tier, before processing.&lt;/summary&gt;
+public class Order
+{
+    public int Id { get; set; }
+
+    [Required, StringLength(30)]
+    public string OrderNumber { get; set; } = string.Empty;
+
+    public int CustomerId { get; set; }
+    public Customer? Customer { get; set; }
+
+    public DateTime OrderDate { get; set; } = DateTime.UtcNow;
+
+    /// &lt;summary&gt;Sum of all order line totals. Computed server side, never trusted from the form.&lt;/summary&gt;
+    [Column(TypeName = &quot;decimal(18,2)&quot;)]
+    public decimal TotalAmount { get; set; }
+
+    /// &lt;summary&gt;Money paid up front. The accept/reject rule compares this against &lt;see cref=&quot;TotalAmount&quot;/&gt;.&lt;/summary&gt;
+    [Column(TypeName = &quot;decimal(18,2)&quot;)]
+    public decimal AdvanceAmount { get; set; }
+
+    public OrderStatus Status { get; set; } = OrderStatus.Received;
+
+    [StringLength(500)]
+    public string? StatusMessage { get; set; }
+
+    public DateTime? ProcessedOn { get; set; }
+
+    public ICollection&lt;OrderDetail&gt; OrderDetails { get; set; } = new List&lt;OrderDetail&gt;();
+
+    /// &lt;summary&gt;Advance as a percentage of the total. Zero-total orders are treated as 0%.&lt;/summary&gt;
+    [NotMapped]
+    public decimal AdvancePercentage =&gt;
+        TotalAmount &lt;= 0 ? 0 : Math.Round(AdvanceAmount / TotalAmount * 100m, 2);
+}</code></pre>
+
+
+<h3 id="step5">Step 5: Create Models\OrderDetail.cs</h3>
+<p>One row per product line. The important design decision is that <code>UnitPrice</code> is
+copied onto the line rather than read through the <code>Product</code> navigation property at
+display time.</p>
+<p>That is a price snapshot. If somebody edits the catalogue next week, last week's orders still
+show what the customer actually agreed to pay. Without the snapshot, changing a product price
+would silently rewrite the history of every order that referenced it.</p>
+<pre class="code" data-lang="csharp"><code>using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace MVC_HealthCheck.Models;
+
+/// &lt;summary&gt;SQL Server entity. One product line on an order.&lt;/summary&gt;
+public class OrderDetail
+{
+    public int Id { get; set; }
+
+    public int OrderId { get; set; }
+    public Order? Order { get; set; }
+
+    public int ProductId { get; set; }
+    public Product? Product { get; set; }
+
+    [Range(1, 10_000)]
+    public int Quantity { get; set; }
+
+    /// &lt;summary&gt;Price snapshot taken when the order was placed, so later catalogue edits do not rewrite history.&lt;/summary&gt;
+    [Column(TypeName = &quot;decimal(18,2)&quot;)]
+    public decimal UnitPrice { get; set; }
+
+    [Column(TypeName = &quot;decimal(18,2)&quot;)]
+    public decimal LineTotal { get; set; }
+}</code></pre>
+
+
+<h3 id="step6">Step 6: Create Models\ProcessedOrder.cs</h3>
+<p>This is the only entity that lives in PostgreSQL. It is the decision record the background
+worker writes after applying the advance rule.</p>
+<p>It is deliberately denormalised. It copies the customer name and the amounts instead of
+holding foreign keys, because it never joins back to SQL Server and never can: it is in a
+different database engine entirely. Treating it as a self contained read model is what makes the
+split storage workable. The snake_case column names come from the explicit
+<code>[Column]</code> attributes, which keeps the table idiomatic for PostgreSQL rather than
+carrying .NET naming into the database.</p>
+<pre class="code" data-lang="csharp"><code>using System.ComponentModel.DataAnnotations;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace MVC_HealthCheck.Models;
+
+/// &lt;summary&gt;
+/// PostgreSQL entity. The outcome record the background worker writes after applying the
+/// advance rule. Deliberately denormalised: it is a read model and never joins back to SQL Server.
+/// &lt;/summary&gt;
+[Table(&quot;processed_orders&quot;)]
+public class ProcessedOrder
+{
+    [Column(&quot;id&quot;)]
+    public int Id { get; set; }
+
+    /// &lt;summary&gt;Primary key of the originating row in the SQL Server Orders table.&lt;/summary&gt;
+    [Column(&quot;order_id&quot;)]
+    public int OrderId { get; set; }
+
+    [Column(&quot;order_number&quot;), StringLength(30)]
+    public string OrderNumber { get; set; } = string.Empty;
+
+    [Column(&quot;customer_id&quot;)]
+    public int CustomerId { get; set; }
+
+    [Column(&quot;customer_name&quot;), StringLength(150)]
+    public string CustomerName { get; set; } = string.Empty;
+
+    [Column(&quot;total_amount&quot;, TypeName = &quot;numeric(18,2)&quot;)]
+    public decimal TotalAmount { get; set; }
+
+    [Column(&quot;advance_amount&quot;, TypeName = &quot;numeric(18,2)&quot;)]
+    public decimal AdvanceAmount { get; set; }
+
+    [Column(&quot;advance_percentage&quot;, TypeName = &quot;numeric(9,2)&quot;)]
+    public decimal AdvancePercentage { get; set; }
+
+    /// &lt;summary&gt;&quot;Accepted&quot; or &quot;Rejected&quot;. Stored as text so the read model stays decoupled from the enum.&lt;/summary&gt;
+    [Column(&quot;decision&quot;), StringLength(20)]
+    public string Decision { get; set; } = string.Empty;
+
+    [Column(&quot;reason&quot;), StringLength(400)]
+    public string Reason { get; set; } = string.Empty;
+
+    [Column(&quot;item_count&quot;)]
+    public int ItemCount { get; set; }
+
+    [Column(&quot;order_placed_on_utc&quot;)]
+    public DateTime OrderPlacedOnUtc { get; set; }
+
+    [Column(&quot;processed_on_utc&quot;)]
+    public DateTime ProcessedOnUtc { get; set; }
+
+    [Column(&quot;processing_duration_ms&quot;)]
+    public long ProcessingDurationMs { get; set; }
+
+    [NotMapped]
+    public bool IsAccepted =&gt; string.Equals(Decision, &quot;Accepted&quot;, StringComparison.OrdinalIgnoreCase);
+}</code></pre>
+
+
+<h3 id="step7">Step 7: Create Messaging\OrderMessage.cs</h3>
+<p>This is the contract between the web tier and the background worker, serialised as JSON onto
+the queue.</p>
+<p>It carries everything the worker needs to make its decision, which means the worker does not
+have to read the order back from SQL Server before it can evaluate the rule. It is a
+<code>record</code> with <code>required</code> members, so a message that is missing a field
+fails to deserialise rather than quietly arriving with a zero total, which would make every
+order look rejected.</p>
+<pre class="code" data-lang="csharp"><code>namespace MVC_HealthCheck.Messaging;
+
+/// &lt;summary&gt;
+/// The RabbitMQ payload. Carries everything the worker needs so it does not have to read
+/// back from SQL Server before making the accept/reject decision.
+/// &lt;/summary&gt;
+public sealed record OrderMessage
+{
+    public required int OrderId { get; init; }
+    public required string OrderNumber { get; init; }
+    public required int CustomerId { get; init; }
+    public required string CustomerName { get; init; }
+    public required decimal TotalAmount { get; init; }
+    public required decimal AdvanceAmount { get; init; }
+    public required int ItemCount { get; init; }
+    public required DateTime OrderPlacedOnUtc { get; init; }
+}</code></pre>
+
+
+<h3 id="step8">Step 8: Create Options\RabbitMqOptions.cs</h3>
+<p>A strongly typed settings class bound to the <code>RabbitMq</code> section of
+<code>appsettings.json</code>. The <code>SectionName</code> constant keeps the magic string in
+one place instead of scattered through <code>Program.cs</code>.</p>
+<pre class="code" data-lang="csharp"><code>namespace MVC_HealthCheck.Options;
+
+/// &lt;summary&gt;Bound from the &quot;RabbitMq&quot; section of appsettings.json.&lt;/summary&gt;
+public sealed class RabbitMqOptions
+{
+    public const string SectionName = &quot;RabbitMq&quot;;
+
+    public string HostName { get; set; } = &quot;localhost&quot;;
+    public int Port { get; set; } = 5672;
+    public string UserName { get; set; } = &quot;guest&quot;;
+    public string Password { get; set; } = &quot;guest&quot;;
+    public string VirtualHost { get; set; } = &quot;/&quot;;
+
+    /// &lt;summary&gt;Durable queue the web tier publishes to and the background worker consumes from.&lt;/summary&gt;
+    public string QueueName { get; set; } = &quot;order-processing-queue&quot;;
+}</code></pre>
+
+
+<h3 id="step9">Step 9: Create Options\OrderProcessingOptions.cs</h3>
+<p>The business rule itself is configuration, not a hard coded constant.
+<code>MinimumAdvancePercentage</code> defaults to 50, which is the rule in the brief, but it can
+be changed without recompiling.</p>
+<p><code>SimulatedWorkMilliseconds</code> adds a deliberate delay inside the worker. It exists
+purely so the Received, Queued and Processing transitions are visible in the UI instead of
+flashing past. Set it to zero in a real system.</p>
+<pre class="code" data-lang="csharp"><code>namespace MVC_HealthCheck.Options;
+
+/// &lt;summary&gt;Bound from the &quot;OrderProcessing&quot; section of appsettings.json.&lt;/summary&gt;
+public sealed class OrderProcessingOptions
+{
+    public const string SectionName = &quot;OrderProcessing&quot;;
+
+    /// &lt;summary&gt;
+    /// Minimum advance, as a percentage of the order total, for an order to be accepted.
+    /// The business rule in the brief is 50%.
+    /// &lt;/summary&gt;
+    public decimal MinimumAdvancePercentage { get; set; } = 50m;
+
+    /// &lt;summary&gt;Artificial delay so the Queued -&gt; Processing -&gt; Accepted transition is visible in the UI.&lt;/summary&gt;
+    public int SimulatedWorkMilliseconds { get; set; } = 750;
+
+    /// &lt;summary&gt;How many recent orders each Redis activity list keeps.&lt;/summary&gt;
+    public int CacheListLength { get; set; } = 50;
+}</code></pre>
+
+
+<h3 id="step10">Step 10: Create Data\OrdersDbContext.cs</h3>
+<p>The SQL Server side of the application. This context owns Customers, Products, Orders and
+OrderDetails.</p>
+<p>Three configuration choices are worth reading closely. The status is persisted with
+<code>HasConversion&lt;string&gt;()</code>, so the Orders table holds the word
+<code>Accepted</code> rather than the integer <code>3</code>, which makes the table readable
+straight from SSMS. The customer relationship uses <code>DeleteBehavior.Restrict</code>, so you
+cannot delete a customer who has orders. The order to order detail relationship uses
+<code>Cascade</code>, because a line has no meaning without its order.</p>
+<pre class="code" data-lang="csharp"><code>using Microsoft.EntityFrameworkCore;
+using MVC_HealthCheck.Models;
+
+namespace MVC_HealthCheck.Data;
+
+/// &lt;summary&gt;
+/// SQL Server write model: Customers, Products, Orders, OrderDetails.
+/// This is the system of record for orders as they are captured.
+/// &lt;/summary&gt;
+public class OrdersDbContext : DbContext
+{
+    public OrdersDbContext(DbContextOptions&lt;OrdersDbContext&gt; options) : base(options) { }
+
+    public DbSet&lt;Customer&gt; Customers =&gt; Set&lt;Customer&gt;();
+    public DbSet&lt;Product&gt; Products =&gt; Set&lt;Product&gt;();
+    public DbSet&lt;Order&gt; Orders =&gt; Set&lt;Order&gt;();
+    public DbSet&lt;OrderDetail&gt; OrderDetails =&gt; Set&lt;OrderDetail&gt;();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity&lt;Customer&gt;(e =&gt;
+        {
+            e.ToTable(&quot;Customers&quot;);
+            e.HasIndex(c =&gt; c.Email).IsUnique();
+        });
+
+        modelBuilder.Entity&lt;Product&gt;(e =&gt;
+        {
+            e.ToTable(&quot;Products&quot;);
+            e.HasIndex(p =&gt; p.Sku).IsUnique();
+        });
+
+        modelBuilder.Entity&lt;Order&gt;(e =&gt;
+        {
+            e.ToTable(&quot;Orders&quot;);
+            e.HasIndex(o =&gt; o.OrderNumber).IsUnique();
+            e.HasIndex(o =&gt; o.Status);
+
+            // Status is persisted as text so the table stays readable from SSMS.
+            e.Property(o =&gt; o.Status)
+                .HasConversion&lt;string&gt;()
+                .HasMaxLength(20);
+
+            e.HasOne(o =&gt; o.Customer)
+                .WithMany(c =&gt; c.Orders)
+                .HasForeignKey(o =&gt; o.CustomerId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        modelBuilder.Entity&lt;OrderDetail&gt;(e =&gt;
+        {
+            e.ToTable(&quot;OrderDetails&quot;);
+
+            e.HasOne(d =&gt; d.Order)
+                .WithMany(o =&gt; o.OrderDetails)
+                .HasForeignKey(d =&gt; d.OrderId)
+                .OnDelete(DeleteBehavior.Cascade);
+
+            e.HasOne(d =&gt; d.Product)
+                .WithMany(p =&gt; p.OrderDetails)
+                .HasForeignKey(d =&gt; d.ProductId)
+                .OnDelete(DeleteBehavior.Restrict);
+        });
+
+        base.OnModelCreating(modelBuilder);
+    }
+}</code></pre>
+
+
+<h3 id="step11">Step 11: Create Data\ProcessedOrdersDbContext.cs</h3>
+<p>The PostgreSQL side, and it holds exactly one table.</p>
+<p>The unique index on <code>OrderId</code> is the important line. It is what makes the worker
+safe to re-run: if RabbitMQ redelivers a message, the worker finds the existing row and updates
+it instead of inserting a duplicate. The timestamps are explicitly mapped to
+<code>timestamp with time zone</code>, because Npgsql is strict about UTC handling and will
+throw at runtime if a <code>DateTime</code> with the wrong <code>Kind</code> reaches a
+<code>timestamptz</code> column.</p>
+<pre class="code" data-lang="csharp"><code>using Microsoft.EntityFrameworkCore;
+using MVC_HealthCheck.Models;
+
+namespace MVC_HealthCheck.Data;
+
+/// &lt;summary&gt;
+/// PostgreSQL read model: the single processed_orders table the background worker writes to
+/// once the advance rule has been applied.
+/// &lt;/summary&gt;
+public class ProcessedOrdersDbContext : DbContext
+{
+    public ProcessedOrdersDbContext(DbContextOptions&lt;ProcessedOrdersDbContext&gt; options) : base(options) { }
+
+    public DbSet&lt;ProcessedOrder&gt; ProcessedOrders =&gt; Set&lt;ProcessedOrder&gt;();
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity&lt;ProcessedOrder&gt;(e =&gt;
+        {
+            e.ToTable(&quot;processed_orders&quot;);
+
+            // The worker is idempotent: a redelivered message must not create a second row.
+            e.HasIndex(p =&gt; p.OrderId).IsUnique();
+            e.HasIndex(p =&gt; p.Decision);
+            e.HasIndex(p =&gt; p.ProcessedOnUtc);
+
+            e.Property(p =&gt; p.OrderPlacedOnUtc).HasColumnType(&quot;timestamp with time zone&quot;);
+            e.Property(p =&gt; p.ProcessedOnUtc).HasColumnType(&quot;timestamp with time zone&quot;);
+        });
+
+        base.OnModelCreating(modelBuilder);
+    }
+}</code></pre>
+
+
+<h3 id="step12">Step 12: Create Data\DatabaseInitializer.cs</h3>
+<p>This creates both schemas at startup and seeds the catalogue with five customers and eight
+products, so the application is usable the first time it runs.</p>
+<p>The design decision that matters is the error handling. Both initialisers catch and log
+instead of throwing. If PostgreSQL is down, the application still starts, and the outage shows up
+on the health endpoint where it belongs. An initialiser that throws would turn a dependency
+outage into a process that will not boot, which is strictly less useful: you lose the health
+endpoint that would have told you what was wrong.</p>
+<p><code>EnsureCreatedAsync</code> is the right tool for a demo because it needs no migration
+files. For a system that evolves, swap it for EF Core migrations, since
+<code>EnsureCreated</code> cannot upgrade an existing schema.</p>
+<pre class="code" data-lang="csharp"><code>using Microsoft.EntityFrameworkCore;
+using MVC_HealthCheck.Models;
+
+namespace MVC_HealthCheck.Data;
+
+/// &lt;summary&gt;
+/// Creates both schemas on startup and seeds the SQL Server catalogue.
+/// Failures are logged rather than thrown: a database being down should surface through the
+/// health endpoint, not prevent the app from booting.
+/// &lt;/summary&gt;
+public static class DatabaseInitializer
+{
+    public static async Task InitializeAsync(IServiceProvider services, CancellationToken cancellationToken = default)
+    {
+        using var scope = services.CreateScope();
+        var logger = scope.ServiceProvider.GetRequiredService&lt;ILoggerFactory&gt;().CreateLogger(&quot;DatabaseInitializer&quot;);
+
+        await InitializeSqlServerAsync(scope.ServiceProvider, logger, cancellationToken);
+        await InitializePostgreSqlAsync(scope.ServiceProvider, logger, cancellationToken);
+    }
+
+    private static async Task InitializeSqlServerAsync(IServiceProvider sp, ILogger logger, CancellationToken ct)
+    {
+        try
+        {
+            var db = sp.GetRequiredService&lt;OrdersDbContext&gt;();
+            await db.Database.EnsureCreatedAsync(ct);
+            await SeedCatalogueAsync(db, ct);
+            logger.LogInformation(&quot;SQL Server schema ready (Customers, Products, Orders, OrderDetails).&quot;);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, &quot;SQL Server initialisation failed. The sql-server health check will report Unhealthy.&quot;);
+        }
+    }
+
+    private static async Task InitializePostgreSqlAsync(IServiceProvider sp, ILogger logger, CancellationToken ct)
+    {
+        try
+        {
+            var db = sp.GetRequiredService&lt;ProcessedOrdersDbContext&gt;();
+            await db.Database.EnsureCreatedAsync(ct);
+            logger.LogInformation(&quot;PostgreSQL schema ready (processed_orders).&quot;);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, &quot;PostgreSQL initialisation failed. The postgresql health check will report Unhealthy.&quot;);
+        }
+    }
+
+    private static async Task SeedCatalogueAsync(OrdersDbContext db, CancellationToken ct)
+    {
+        if (!await db.Customers.AnyAsync(ct))
+        {
+            db.Customers.AddRange(
+                new Customer { Name = &quot;Mahesh Sabnis&quot;, Email = &quot;mahesh@example.com&quot;, Phone = &quot;9890000001&quot;, City = &quot;Pune&quot; },
+                new Customer { Name = &quot;Leena Kulkarni&quot;, Email = &quot;leena@example.com&quot;, Phone = &quot;9890000002&quot;, City = &quot;Mumbai&quot; },
+                new Customer { Name = &quot;Arjun Deshpande&quot;, Email = &quot;arjun@example.com&quot;, Phone = &quot;9890000003&quot;, City = &quot;Bengaluru&quot; },
+                new Customer { Name = &quot;Fatima Shaikh&quot;, Email = &quot;fatima@example.com&quot;, Phone = &quot;9890000004&quot;, City = &quot;Hyderabad&quot; },
+                new Customer { Name = &quot;Rohit Nair&quot;, Email = &quot;rohit@example.com&quot;, Phone = &quot;9890000005&quot;, City = &quot;Kochi&quot; });
+        }
+
+        if (!await db.Products.AnyAsync(ct))
+        {
+            db.Products.AddRange(
+                new Product { Name = &quot;Mechanical Keyboard&quot;,   Sku = &quot;KBD-MECH-87&quot;,  UnitPrice = 7_499.00m,  StockQuantity = 120 },
+                new Product { Name = &quot;27\&quot; 4K Monitor&quot;,       Sku = &quot;MON-4K-27&quot;,    UnitPrice = 32_900.00m, StockQuantity = 45  },
+                new Product { Name = &quot;Wireless Mouse&quot;,        Sku = &quot;MSE-WL-02&quot;,    UnitPrice = 2_250.00m,  StockQuantity = 300 },
+                new Product { Name = &quot;USB-C Docking Station&quot;, Sku = &quot;DCK-USBC-11&quot;,  UnitPrice = 14_750.00m, StockQuantity = 60  },
+                new Product { Name = &quot;Noise Cancelling Headset&quot;, Sku = &quot;HDS-NC-44&quot;, UnitPrice = 18_999.00m, StockQuantity = 80  },
+                new Product { Name = &quot;Laptop Stand (Aluminium)&quot;, Sku = &quot;STD-ALU-09&quot;, UnitPrice = 3_199.00m, StockQuantity = 210 },
+                new Product { Name = &quot;1080p Webcam&quot;,          Sku = &quot;CAM-HD-10&quot;,    UnitPrice = 5_650.00m,  StockQuantity = 150 },
+                new Product { Name = &quot;2TB NVMe SSD&quot;,          Sku = &quot;SSD-NVME-2T&quot;,  UnitPrice = 16_400.00m, StockQuantity = 95  });
+        }
+
+        await db.SaveChangesAsync(ct);
+    }
+}</code></pre>
+
+
+<h3 id="step13">Step 13: Create Services\OrderCacheEntry.cs</h3>
+<p>Two small records that describe what the application keeps in Redis: the rows of the two
+activity lists, and the four counters shown on the dashboard tiles.</p>
+<pre class="code" data-lang="csharp"><code>namespace MVC_HealthCheck.Services;
+
+/// &lt;summary&gt;A row in one of the Redis activity lists shown on the dashboard.&lt;/summary&gt;
+public sealed record OrderCacheEntry
+{
+    public required int OrderId { get; init; }
+    public required string OrderNumber { get; init; }
+    public required string CustomerName { get; init; }
+    public required decimal TotalAmount { get; init; }
+    public required decimal AdvanceAmount { get; init; }
+    public required decimal AdvancePercentage { get; init; }
+
+    /// &lt;summary&gt;&quot;Received&quot; for the inbound list, &quot;Accepted&quot;/&quot;Rejected&quot; for the processed list.&lt;/summary&gt;
+    public required string Status { get; init; }
+
+    public string? Reason { get; init; }
+    public required DateTime TimestampUtc { get; init; }
+}
+
+/// &lt;summary&gt;Counters rendered on the dashboard tiles.&lt;/summary&gt;
+public sealed record OrderCacheCounters
+{
+    public long Received { get; init; }
+    public long Processed { get; init; }
+    public long Accepted { get; init; }
+    public long Rejected { get; init; }
+}</code></pre>
+
+
+<h3 id="step14">Step 14: Create Services\IOrderCache.cs</h3>
+<p>The cache abstraction. Read the comment on the interface carefully, because it is a contract
+about failure rather than about data: every method swallows connection errors and degrades to an
+empty result.</p>
+<p>That is a deliberate decision about what Redis is for in this application. It holds activity
+and counters, which are convenience data. The orders themselves are durable in SQL Server. So a
+Redis outage should make the dashboard go quiet, not take the site down.</p>
+<pre class="code" data-lang="csharp"><code>namespace MVC_HealthCheck.Services;
+
+/// &lt;summary&gt;
+/// Redis-backed activity cache. Every method swallows connection errors and degrades to an
+/// empty result, so a Redis outage shows up on /health without taking the UI down.
+/// &lt;/summary&gt;
+public interface IOrderCache
+{
+    Task RecordReceivedAsync(OrderCacheEntry entry, CancellationToken ct = default);
+    Task RecordProcessedAsync(OrderCacheEntry entry, CancellationToken ct = default);
+
+    Task&lt;IReadOnlyList&lt;OrderCacheEntry&gt;&gt; GetReceivedAsync(int count = 25, CancellationToken ct = default);
+    Task&lt;IReadOnlyList&lt;OrderCacheEntry&gt;&gt; GetProcessedAsync(int count = 25, CancellationToken ct = default);
+
+    Task&lt;OrderCacheCounters&gt; GetCountersAsync(CancellationToken ct = default);
+
+    /// &lt;summary&gt;True when the multiplexer currently has a live connection to Redis.&lt;/summary&gt;
+    bool IsAvailable { get; }
+}</code></pre>
+
+
+<h3 id="step15">Step 15: Create Services\RedisOrderCache.cs</h3>
+<p>The implementation, built on <code>StackExchange.Redis</code>.</p>
+<p>Writes go through <code>CreateBatch</code>, so the list push, the trim and the counter
+increments are pipelined to the server in one round trip instead of four. The
+<code>ListTrimAsync</code> call immediately after each push is what stops the activity lists
+growing without bound: they keep the newest <code>CacheListLength</code> entries and discard the
+rest.</p>
+<p>Every public method is wrapped in try/catch, which is what makes good on the promise in the
+interface. Note also that <code>IsAvailable</code> reports
+<code>IConnectionMultiplexer.IsConnected</code>, so the views can tell the user that counters are
+empty because Redis is unreachable rather than because nothing has happened yet.</p>
+<pre class="code" data-lang="csharp"><code>using System.Text.Json;
+using Microsoft.Extensions.Options;
+using MVC_HealthCheck.Options;
+using StackExchange.Redis;
+
+namespace MVC_HealthCheck.Services;
+
+/// &lt;inheritdoc cref=&quot;IOrderCache&quot;/&gt;
+public sealed class RedisOrderCache : IOrderCache
+{
+    // Keys are grouped under an &quot;orders:&quot; prefix so they are easy to scan in redis-cli.
+    private const string ReceivedListKey = &quot;orders:list:received&quot;;
+    private const string ProcessedListKey = &quot;orders:list:processed&quot;;
+    private const string ReceivedCounterKey = &quot;orders:count:received&quot;;
+    private const string ProcessedCounterKey = &quot;orders:count:processed&quot;;
+    private const string AcceptedCounterKey = &quot;orders:count:accepted&quot;;
+    private const string RejectedCounterKey = &quot;orders:count:rejected&quot;;
+
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    private readonly IConnectionMultiplexer _multiplexer;
+    private readonly ILogger&lt;RedisOrderCache&gt; _logger;
+    private readonly int _listLength;
+
+    public RedisOrderCache(
+        IConnectionMultiplexer multiplexer,
+        IOptions&lt;OrderProcessingOptions&gt; options,
+        ILogger&lt;RedisOrderCache&gt; logger)
+    {
+        _multiplexer = multiplexer;
+        _logger = logger;
+        _listLength = Math.Max(1, options.Value.CacheListLength);
+    }
+
+    public bool IsAvailable =&gt; _multiplexer.IsConnected;
+
+    public Task RecordReceivedAsync(OrderCacheEntry entry, CancellationToken ct = default) =&gt;
+        PushAsync(ReceivedListKey, entry, [ReceivedCounterKey]);
+
+    public Task RecordProcessedAsync(OrderCacheEntry entry, CancellationToken ct = default)
+    {
+        var counters = entry.Status.Equals(&quot;Accepted&quot;, StringComparison.OrdinalIgnoreCase)
+            ? new[] { ProcessedCounterKey, AcceptedCounterKey }
+            : new[] { ProcessedCounterKey, RejectedCounterKey };
+
+        return PushAsync(ProcessedListKey, entry, counters);
+    }
+
+    public Task&lt;IReadOnlyList&lt;OrderCacheEntry&gt;&gt; GetReceivedAsync(int count = 25, CancellationToken ct = default) =&gt;
+        RangeAsync(ReceivedListKey, count);
+
+    public Task&lt;IReadOnlyList&lt;OrderCacheEntry&gt;&gt; GetProcessedAsync(int count = 25, CancellationToken ct = default) =&gt;
+        RangeAsync(ProcessedListKey, count);
+
+    public async Task&lt;OrderCacheCounters&gt; GetCountersAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var db = _multiplexer.GetDatabase();
+            var values = await db.StringGetAsync(
+            [
+                ReceivedCounterKey, ProcessedCounterKey, AcceptedCounterKey, RejectedCounterKey
+            ]);
+
+            return new OrderCacheCounters
+            {
+                Received = ToLong(values[0]),
+                Processed = ToLong(values[1]),
+                Accepted = ToLong(values[2]),
+                Rejected = ToLong(values[3])
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, &quot;Could not read order counters from Redis.&quot;);
+            return new OrderCacheCounters();
+        }
+    }
+
+    private async Task PushAsync(string listKey, OrderCacheEntry entry, string[] counterKeys)
+    {
+        try
+        {
+            var db = _multiplexer.GetDatabase();
+            var payload = JsonSerializer.Serialize(entry, JsonOptions);
+
+            // Newest first, then trim so the list cannot grow without bound.
+            var batch = db.CreateBatch();
+            var tasks = new List&lt;Task&gt; { batch.ListLeftPushAsync(listKey, payload) };
+            tasks.Add(batch.ListTrimAsync(listKey, 0, _listLength - 1));
+            tasks.AddRange(counterKeys.Select(k =&gt; (Task)batch.StringIncrementAsync(k)));
+            batch.Execute();
+
+            await Task.WhenAll(tasks);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, &quot;Could not write order {OrderNumber} to the Redis list {ListKey}.&quot;,
+                entry.OrderNumber, listKey);
+        }
+    }
+
+    private async Task&lt;IReadOnlyList&lt;OrderCacheEntry&gt;&gt; RangeAsync(string listKey, int count)
+    {
+        try
+        {
+            var db = _multiplexer.GetDatabase();
+            var values = await db.ListRangeAsync(listKey, 0, Math.Max(1, count) - 1);
+
+            return values
+                .Select(v =&gt; v.HasValue ? SafeDeserialize(v!) : null)
+                .Where(e =&gt; e is not null)
+                .Select(e =&gt; e!)
+                .ToList();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, &quot;Could not read the Redis list {ListKey}.&quot;, listKey);
+            return [];
+        }
+    }
+
+    private OrderCacheEntry? SafeDeserialize(string json)
+    {
+        try
+        {
+            return JsonSerializer.Deserialize&lt;OrderCacheEntry&gt;(json, JsonOptions);
+        }
+        catch (JsonException ex)
+        {
+            _logger.LogWarning(ex, &quot;Skipping malformed cache entry.&quot;);
+            return null;
+        }
+    }
+
+    private static long ToLong(RedisValue value) =&gt; value.HasValue &amp;&amp; value.TryParse(out long l) ? l : 0;
+}</code></pre>
+
+
+<h3 id="step16">Step 16: Create Messaging\RabbitMqConnectionProvider.cs</h3>
+<p>A RabbitMQ connection is expensive and is meant to be long lived and shared, while channels
+are cheap and are not thread safe. This class owns the one shared connection used by the
+publisher, the consumer and the health check.</p>
+<p>The reconnection logic is the reason this class exists rather than a plain singleton
+registration. <code>GetConnectionAsync</code> checks <code>IsOpen</code> on every call and
+rebuilds a dropped connection behind a <code>SemaphoreSlim</code>, so only one caller does the
+rebuilding. If the connection were simply registered as a DI singleton, a broker restart would
+leave the application holding a dead object forever, and the health check would report a failure
+that could never clear itself.</p>
+<pre class="code" data-lang="csharp"><code>using Microsoft.Extensions.Options;
+using MVC_HealthCheck.Options;
+using RabbitMQ.Client;
+
+namespace MVC_HealthCheck.Messaging;
+
+/// &lt;summary&gt;
+/// Owns the single long-lived RabbitMQ connection shared by the publisher, the consumer and
+/// the rabbitmq health check.
+///
+/// The connection is created lazily and re-created when it drops, so the broker can be
+/// restarted underneath a running app and the health check will recover on its own instead of
+/// pinning itself to a dead connection.
+/// &lt;/summary&gt;
+public sealed class RabbitMqConnectionProvider : IAsyncDisposable
+{
+    private readonly RabbitMqOptions _options;
+    private readonly ILogger&lt;RabbitMqConnectionProvider&gt; _logger;
+    private readonly SemaphoreSlim _gate = new(1, 1);
+
+    private IConnection? _connection;
+    private bool _disposed;
+
+    public RabbitMqConnectionProvider(IOptions&lt;RabbitMqOptions&gt; options, ILogger&lt;RabbitMqConnectionProvider&gt; logger)
+    {
+        _options = options.Value;
+        _logger = logger;
+    }
+
+    public string QueueName =&gt; _options.QueueName;
+
+    public async Task&lt;IConnection&gt; GetConnectionAsync(CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var existing = _connection;
+        if (existing is { IsOpen: true })
+        {
+            return existing;
+        }
+
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (_connection is { IsOpen: true })
+            {
+                return _connection;
+            }
+
+            if (_connection is not null)
+            {
+                _logger.LogWarning(&quot;RabbitMQ connection was closed. Reconnecting.&quot;);
+                await SafeDisposeAsync(_connection);
+                _connection = null;
+            }
+
+            var factory = new ConnectionFactory
+            {
+                HostName = _options.HostName,
+                Port = _options.Port,
+                UserName = _options.UserName,
+                Password = _options.Password,
+                VirtualHost = _options.VirtualHost,
+                AutomaticRecoveryEnabled = true,
+                TopologyRecoveryEnabled = true
+            };
+
+            _connection = await factory.CreateConnectionAsync(&quot;mvc-healthcheck-order-processing&quot;, ct);
+            _logger.LogInformation(&quot;Connected to RabbitMQ at {Host}:{Port}.&quot;, _options.HostName, _options.Port);
+            return _connection;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// &lt;summary&gt;Declares the durable work queue. Idempotent, so both publisher and consumer call it.&lt;/summary&gt;
+    public async Task DeclareQueueAsync(IChannel channel, CancellationToken ct = default)
+    {
+        await channel.QueueDeclareAsync(
+            queue: _options.QueueName,
+            durable: true,
+            exclusive: false,
+            autoDelete: false,
+            arguments: null,
+            cancellationToken: ct);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_disposed) return;
+        _disposed = true;
+
+        if (_connection is not null)
+        {
+            await SafeDisposeAsync(_connection);
+            _connection = null;
+        }
+
+        _gate.Dispose();
+    }
+
+    private async Task SafeDisposeAsync(IConnection connection)
+    {
+        try
+        {
+            await connection.DisposeAsync();
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, &quot;Ignoring error while disposing a RabbitMQ connection.&quot;);
+        }
+    }
+}</code></pre>
+
+
+<h3 id="step17">Step 17: Create Messaging\IOrderPublisher.cs</h3>
+<p>A one method abstraction over publishing, so <code>OrderService</code> does not take a
+dependency on the RabbitMQ client types directly.</p>
+<pre class="code" data-lang="csharp"><code>namespace MVC_HealthCheck.Messaging;
+
+/// &lt;summary&gt;Publishes a captured order onto the RabbitMQ work queue.&lt;/summary&gt;
+public interface IOrderPublisher
+{
+    Task PublishAsync(OrderMessage message, CancellationToken ct = default);
+}</code></pre>
+
+
+<h3 id="step18">Step 18: Create Messaging\RabbitMqOrderPublisher.cs</h3>
+<p>The publisher. It takes the shared connection from the provider and opens a fresh channel per
+publish, which is the recommended pattern: channels are cheap, and they are not safe to share
+across concurrent requests.</p>
+<p><code>Persistent = true</code> on the message properties, combined with
+<code>durable: true</code> on the queue declaration, is what survives a broker restart. You need
+both. A durable queue with non persistent messages still loses the messages, and persistent
+messages on a non durable queue lose the queue.</p>
+<p>Note that this code targets <code>RabbitMQ.Client</code> version 7, where the API is fully
+asynchronous. <code>CreateChannelAsync</code>, <code>QueueDeclareAsync</code> and
+<code>BasicPublishAsync</code> all replace the synchronous version 6 methods, and
+<code>BasicProperties</code> is now instantiated directly rather than created from the
+channel.</p>
+<pre class="code" data-lang="csharp"><code>using System.Text;
+using System.Text.Json;
+using RabbitMQ.Client;
+
+namespace MVC_HealthCheck.Messaging;
+
+/// &lt;inheritdoc cref=&quot;IOrderPublisher&quot;/&gt;
+public sealed class RabbitMqOrderPublisher : IOrderPublisher
+{
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+
+    private readonly RabbitMqConnectionProvider _connections;
+    private readonly ILogger&lt;RabbitMqOrderPublisher&gt; _logger;
+
+    public RabbitMqOrderPublisher(RabbitMqConnectionProvider connections, ILogger&lt;RabbitMqOrderPublisher&gt; logger)
+    {
+        _connections = connections;
+        _logger = logger;
+    }
+
+    public async Task PublishAsync(OrderMessage message, CancellationToken ct = default)
+    {
+        var connection = await _connections.GetConnectionAsync(ct);
+
+        // A channel is cheap and is not thread safe, so each publish gets its own.
+        await using var channel = await connection.CreateChannelAsync(cancellationToken: ct);
+        await _connections.DeclareQueueAsync(channel, ct);
+
+        var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, JsonOptions));
+
+        var properties = new BasicProperties
+        {
+            Persistent = true,
+            ContentType = &quot;application/json&quot;,
+            MessageId = message.OrderNumber,
+            Timestamp = new AmqpTimestamp(DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+        };
+
+        await channel.BasicPublishAsync(
+            exchange: string.Empty,
+            routingKey: _connections.QueueName,
+            mandatory: false,
+            basicProperties: properties,
+            body: body,
+            cancellationToken: ct);
+
+        _logger.LogInformation(&quot;Published order {OrderNumber} to queue {Queue}.&quot;,
+            message.OrderNumber, _connections.QueueName);
+    }
+}</code></pre>
+
+
+<h3 id="step19">Step 19: Create Services\OrderProcessingWorker.cs</h3>
+<p>This is the heart of the application: a <code>BackgroundService</code> that consumes from the
+queue, applies the advance rule and writes the outcome.</p>
+<p><code>ExecuteAsync</code> wraps the consumer in a retry loop, so if the broker is unavailable
+at startup, or goes away later, the worker keeps trying every five seconds instead of dying
+silently. <code>BasicQosAsync</code> with a prefetch of 1 means the worker holds one
+unacknowledged message at a time.</p>
+<p>The acknowledgement strategy is worth understanding. Messages are consumed with
+<code>autoAck: false</code>, so a message is only removed from the queue after
+<code>BasicAckAsync</code>. If processing throws, the handler calls
+<code>BasicNackAsync</code> with <code>requeue: false</code>. Requeueing a message that failed
+for a deterministic reason would put it straight back at the head of the queue and loop forever,
+a classic poison message. Instead the order is marked <code>Failed</code> in SQL Server, where it
+stays visible on the Order Status screen.</p>
+<p>Inside <code>ProcessAsync</code>, note that a scope is created per message.
+<code>BackgroundService</code> is a singleton, and <code>DbContext</code> is scoped, so the
+worker must open its own scope rather than inject a context directly. The write to PostgreSQL is
+an upsert guarded by the unique index on <code>order_id</code>, which is what makes a redelivered
+message harmless.</p>
+<pre class="code" data-lang="csharp"><code>using System.Diagnostics;
+using System.Text;
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using MVC_HealthCheck.Data;
+using MVC_HealthCheck.Messaging;
+using MVC_HealthCheck.Models;
+using MVC_HealthCheck.Options;
+using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
+
+namespace MVC_HealthCheck.Services;
+
+/// &lt;summary&gt;
+/// Consumes orders from RabbitMQ, applies the advance rule, writes the outcome to PostgreSQL,
+/// updates the SQL Server order status and pushes the result onto the Redis activity list.
+///
+/// The rule: an order is Accepted when the advance is at least
+/// &lt;see cref=&quot;OrderProcessingOptions.MinimumAdvancePercentage&quot;/&gt; (50% by default) of the order
+/// total. Anything below that is Rejected.
+/// &lt;/summary&gt;
+public sealed class OrderProcessingWorker : BackgroundService
+{
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
+    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
+
+    private readonly RabbitMqConnectionProvider _connections;
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly OrderProcessingOptions _options;
+    private readonly ILogger&lt;OrderProcessingWorker&gt; _logger;
+
+    public OrderProcessingWorker(
+        RabbitMqConnectionProvider connections,
+        IServiceScopeFactory scopeFactory,
+        IOptions&lt;OrderProcessingOptions&gt; options,
+        ILogger&lt;OrderProcessingWorker&gt; logger)
+    {
+        _connections = connections;
+        _scopeFactory = scopeFactory;
+        _options = options.Value;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        // Keep trying to attach to the broker. If RabbitMQ is down at boot the app still starts
+        // and the rabbitmq health check reports the outage.
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                await ConsumeAsync(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, &quot;Order consumer dropped out. Retrying in {Delay}s.&quot;, ReconnectDelay.TotalSeconds);
+                try
+                {
+                    await Task.Delay(ReconnectDelay, stoppingToken);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    private async Task ConsumeAsync(CancellationToken stoppingToken)
+    {
+        var connection = await _connections.GetConnectionAsync(stoppingToken);
+        await using var channel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
+
+        await _connections.DeclareQueueAsync(channel, stoppingToken);
+
+        // One unacknowledged message at a time keeps the UI transitions easy to follow.
+        await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false, cancellationToken: stoppingToken);
+
+        var consumer = new AsyncEventingBasicConsumer(channel);
+        consumer.ReceivedAsync += async (_, args) =&gt; await HandleDeliveryAsync(channel, args, stoppingToken);
+
+        await channel.BasicConsumeAsync(
+            queue: _connections.QueueName,
+            autoAck: false,
+            consumer: consumer,
+            cancellationToken: stoppingToken);
+
+        _logger.LogInformation(&quot;Order processing worker is consuming from {Queue}.&quot;, _connections.QueueName);
+
+        // Park here until shutdown; the consumer callbacks do the work.
+        var idle = new TaskCompletionSource();
+        await using (stoppingToken.Register(() =&gt; idle.TrySetResult()))
+        {
+            await idle.Task;
+        }
+    }
+
+    private async Task HandleDeliveryAsync(IChannel channel, BasicDeliverEventArgs args, CancellationToken ct)
+    {
+        OrderMessage? message = null;
+
+        try
+        {
+            var json = Encoding.UTF8.GetString(args.Body.Span);
+            message = JsonSerializer.Deserialize&lt;OrderMessage&gt;(json, JsonOptions);
+
+            if (message is null)
+            {
+                _logger.LogWarning(&quot;Discarding an unreadable message (delivery tag {Tag}).&quot;, args.DeliveryTag);
+                await channel.BasicNackAsync(args.DeliveryTag, multiple: false, requeue: false, cancellationToken: ct);
+                return;
+            }
+
+            await ProcessAsync(message, ct);
+            await channel.BasicAckAsync(args.DeliveryTag, multiple: false, cancellationToken: ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, &quot;Failed to process order {OrderNumber}.&quot;, message?.OrderNumber ?? &quot;unknown&quot;);
+
+            if (message is not null)
+            {
+                await MarkFailedAsync(message, ex, ct);
+            }
+
+            // Do not requeue: a poison message would otherwise loop forever. The order is left
+            // in the Failed state and stays visible on the Order Status screen.
+            await channel.BasicNackAsync(args.DeliveryTag, multiple: false, requeue: false, cancellationToken: ct);
+        }
+    }
+
+    private async Task ProcessAsync(OrderMessage message, CancellationToken ct)
+    {
+        var stopwatch = Stopwatch.StartNew();
+
+        using var scope = _scopeFactory.CreateScope();
+        var sql = scope.ServiceProvider.GetRequiredService&lt;OrdersDbContext&gt;();
+        var pg = scope.ServiceProvider.GetRequiredService&lt;ProcessedOrdersDbContext&gt;();
+        var cache = scope.ServiceProvider.GetRequiredService&lt;IOrderCache&gt;();
+
+        var order = await sql.Orders.FirstOrDefaultAsync(o =&gt; o.Id == message.OrderId, ct);
+        if (order is null)
+        {
+            _logger.LogWarning(&quot;Order {OrderId} is no longer in SQL Server. Dropping the message.&quot;, message.OrderId);
+            return;
+        }
+
+        order.Status = OrderStatus.Processing;
+        await sql.SaveChangesAsync(ct);
+
+        if (_options.SimulatedWorkMilliseconds &gt; 0)
+        {
+            await Task.Delay(_options.SimulatedWorkMilliseconds, ct);
+        }
+
+        // --- the business rule ---------------------------------------------------------------
+        var advancePercentage = message.TotalAmount &lt;= 0
+            ? 0m
+            : Math.Round(message.AdvanceAmount / message.TotalAmount * 100m, 2);
+
+        var accepted = advancePercentage &gt;= _options.MinimumAdvancePercentage;
+
+        var reason = accepted
+            ? $&quot;Advance of {advancePercentage:0.##}% meets the required minimum of {_options.MinimumAdvancePercentage:0.##}%.&quot;
+            : $&quot;Advance of {advancePercentage:0.##}% is below the required minimum of {_options.MinimumAdvancePercentage:0.##}%.&quot;;
+        // ---------------------------------------------------------------------------------------
+
+        stopwatch.Stop();
+        var processedOnUtc = DateTime.UtcNow;
+
+        // Idempotent: a redelivery updates the existing row rather than inserting a duplicate.
+        var processed = await pg.ProcessedOrders.FirstOrDefaultAsync(p =&gt; p.OrderId == message.OrderId, ct);
+        var isNew = processed is null;
+        processed ??= new ProcessedOrder { OrderId = message.OrderId };
+
+        processed.OrderNumber = message.OrderNumber;
+        processed.CustomerId = message.CustomerId;
+        processed.CustomerName = message.CustomerName;
+        processed.TotalAmount = message.TotalAmount;
+        processed.AdvanceAmount = message.AdvanceAmount;
+        processed.AdvancePercentage = advancePercentage;
+        processed.Decision = accepted ? &quot;Accepted&quot; : &quot;Rejected&quot;;
+        processed.Reason = reason;
+        processed.ItemCount = message.ItemCount;
+        processed.OrderPlacedOnUtc = DateTime.SpecifyKind(message.OrderPlacedOnUtc, DateTimeKind.Utc);
+        processed.ProcessedOnUtc = processedOnUtc;
+        processed.ProcessingDurationMs = stopwatch.ElapsedMilliseconds;
+
+        if (isNew)
+        {
+            pg.ProcessedOrders.Add(processed);
+        }
+
+        await pg.SaveChangesAsync(ct);
+
+        order.Status = accepted ? OrderStatus.Accepted : OrderStatus.Rejected;
+        order.StatusMessage = reason;
+        order.ProcessedOn = processedOnUtc;
+        await sql.SaveChangesAsync(ct);
+
+        await cache.RecordProcessedAsync(new OrderCacheEntry
+        {
+            OrderId = message.OrderId,
+            OrderNumber = message.OrderNumber,
+            CustomerName = message.CustomerName,
+            TotalAmount = message.TotalAmount,
+            AdvanceAmount = message.AdvanceAmount,
+            AdvancePercentage = advancePercentage,
+            Status = processed.Decision,
+            Reason = reason,
+            TimestampUtc = processedOnUtc
+        }, ct);
+
+        _logger.LogInformation(&quot;Order {OrderNumber} {Decision} ({Percentage:0.##}% advance).&quot;,
+            message.OrderNumber, processed.Decision, advancePercentage);
+    }
+
+    private async Task MarkFailedAsync(OrderMessage message, Exception cause, CancellationToken ct)
+    {
+        try
+        {
+            using var scope = _scopeFactory.CreateScope();
+            var sql = scope.ServiceProvider.GetRequiredService&lt;OrdersDbContext&gt;();
+
+            var order = await sql.Orders.FirstOrDefaultAsync(o =&gt; o.Id == message.OrderId, ct);
+            if (order is null) return;
+
+            order.Status = OrderStatus.Failed;
+            order.StatusMessage = $&quot;Processing failed: {cause.Message}&quot;;
+            await sql.SaveChangesAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, &quot;Could not mark order {OrderNumber} as failed.&quot;, message.OrderNumber);
+        }
+    }
+}</code></pre>
+
+
+<h3 id="step20">Step 20: Create Services\OrderService.cs</h3>
+<p>Order capture. This runs inside the web request and does three things in order: write to SQL
+Server, record the order on the Redis activity list, then publish to RabbitMQ.</p>
+<p>The first thing <code>CreateOrderAsync</code> does is throw away the prices from the form and
+re-read them from the catalogue. The posted form supplies only product ids and quantities. This
+is not a theoretical concern: if the client could supply the unit price, it could supply a total
+of its own choosing, and the accept or reject decision depends directly on that total.</p>
+<p>The ordering of the last two steps also matters. The order is already durable in SQL Server
+before the publish is attempted. If the broker is unreachable, the catch block marks the order
+<code>Failed</code> with the broker error in the status message, rather than losing a capture
+that the customer believes succeeded.</p>
+<pre class="code" data-lang="csharp"><code>using Microsoft.EntityFrameworkCore;
+using MVC_HealthCheck.Data;
+using MVC_HealthCheck.Messaging;
+using MVC_HealthCheck.Models;
+using MVC_HealthCheck.ViewModels;
+
+namespace MVC_HealthCheck.Services;
+
+/// &lt;summary&gt;
+/// Order capture: writes the order to SQL Server, records it on the Redis &quot;received&quot; list and
+/// hands it to RabbitMQ for the background worker to decide on.
+/// &lt;/summary&gt;
+public sealed class OrderService
+{
+    private readonly OrdersDbContext _db;
+    private readonly IOrderPublisher _publisher;
+    private readonly IOrderCache _cache;
+    private readonly ILogger&lt;OrderService&gt; _logger;
+
+    public OrderService(
+        OrdersDbContext db,
+        IOrderPublisher publisher,
+        IOrderCache cache,
+        ILogger&lt;OrderService&gt; logger)
+    {
+        _db = db;
+        _publisher = publisher;
+        _cache = cache;
+        _logger = logger;
+    }
+
+    public Task&lt;List&lt;Customer&gt;&gt; GetCustomersAsync(CancellationToken ct = default) =&gt;
+        _db.Customers.AsNoTracking().OrderBy(c =&gt; c.Name).ToListAsync(ct);
+
+    public Task&lt;List&lt;Product&gt;&gt; GetProductsAsync(CancellationToken ct = default) =&gt;
+        _db.Products.AsNoTracking().OrderBy(p =&gt; p.Name).ToListAsync(ct);
+
+    /// &lt;summary&gt;
+    /// Persists the order and publishes it. Pricing is recomputed from the catalogue rather than
+    /// taken from the posted form, so a tampered price cannot change the accept/reject outcome.
+    /// &lt;/summary&gt;
+    public async Task&lt;Order&gt; CreateOrderAsync(CreateOrderViewModel model, CancellationToken ct = default)
+    {
+        var lines = model.Items
+            .Where(i =&gt; i.ProductId &gt; 0 &amp;&amp; i.Quantity &gt; 0)
+            .GroupBy(i =&gt; i.ProductId)
+            .Select(g =&gt; new { ProductId = g.Key, Quantity = g.Sum(x =&gt; x.Quantity) })
+            .ToList();
+
+        if (lines.Count == 0)
+        {
+            throw new InvalidOperationException(&quot;An order needs at least one product line.&quot;);
+        }
+
+        var productIds = lines.Select(l =&gt; l.ProductId).ToList();
+        var products = await _db.Products
+            .Where(p =&gt; productIds.Contains(p.Id))
+            .ToDictionaryAsync(p =&gt; p.Id, ct);
+
+        var missing = productIds.Where(id =&gt; !products.ContainsKey(id)).ToList();
+        if (missing.Count &gt; 0)
+        {
+            throw new InvalidOperationException($&quot;Unknown product id(s): {string.Join(&quot;, &quot;, missing)}.&quot;);
+        }
+
+        var customer = await _db.Customers.FirstOrDefaultAsync(c =&gt; c.Id == model.CustomerId, ct)
+            ?? throw new InvalidOperationException($&quot;Unknown customer id {model.CustomerId}.&quot;);
+
+        var order = new Order
+        {
+            OrderNumber = GenerateOrderNumber(),
+            CustomerId = customer.Id,
+            OrderDate = DateTime.UtcNow,
+            AdvanceAmount = model.AdvanceAmount,
+            Status = OrderStatus.Received,
+            StatusMessage = &quot;Captured, awaiting processing.&quot;
+        };
+
+        foreach (var line in lines)
+        {
+            var product = products[line.ProductId];
+            order.OrderDetails.Add(new OrderDetail
+            {
+                ProductId = product.Id,
+                Quantity = line.Quantity,
+                UnitPrice = product.UnitPrice,
+                LineTotal = product.UnitPrice * line.Quantity
+            });
+        }
+
+        order.TotalAmount = order.OrderDetails.Sum(d =&gt; d.LineTotal);
+
+        _db.Orders.Add(order);
+        await _db.SaveChangesAsync(ct);
+
+        var cacheEntry = new OrderCacheEntry
+        {
+            OrderId = order.Id,
+            OrderNumber = order.OrderNumber,
+            CustomerName = customer.Name,
+            TotalAmount = order.TotalAmount,
+            AdvanceAmount = order.AdvanceAmount,
+            AdvancePercentage = order.AdvancePercentage,
+            Status = &quot;Received&quot;,
+            TimestampUtc = order.OrderDate
+        };
+
+        await _cache.RecordReceivedAsync(cacheEntry, ct);
+
+        try
+        {
+            await _publisher.PublishAsync(new OrderMessage
+            {
+                OrderId = order.Id,
+                OrderNumber = order.OrderNumber,
+                CustomerId = customer.Id,
+                CustomerName = customer.Name,
+                TotalAmount = order.TotalAmount,
+                AdvanceAmount = order.AdvanceAmount,
+                ItemCount = order.OrderDetails.Count,
+                OrderPlacedOnUtc = order.OrderDate
+            }, ct);
+
+            order.Status = OrderStatus.Queued;
+            order.StatusMessage = &quot;Queued for processing.&quot;;
+        }
+        catch (Exception ex)
+        {
+            // The order is already durable in SQL Server. Surface the broker problem on the
+            // status screen instead of losing the capture.
+            _logger.LogError(ex, &quot;Order {OrderNumber} was saved but could not be queued.&quot;, order.OrderNumber);
+            order.Status = OrderStatus.Failed;
+            order.StatusMessage = $&quot;Saved, but publishing to RabbitMQ failed: {ex.Message}&quot;;
+        }
+
+        await _db.SaveChangesAsync(ct);
+        return order;
+    }
+
+    public Task&lt;List&lt;Order&gt;&gt; GetOrdersAsync(OrderStatus? status = null, CancellationToken ct = default)
+    {
+        var query = _db.Orders
+            .AsNoTracking()
+            .Include(o =&gt; o.Customer)
+            .Include(o =&gt; o.OrderDetails)
+                .ThenInclude(d =&gt; d.Product)
+            .AsQueryable();
+
+        if (status.HasValue)
+        {
+            query = query.Where(o =&gt; o.Status == status.Value);
+        }
+
+        return query.OrderByDescending(o =&gt; o.Id).ToListAsync(ct);
+    }
+
+    public Task&lt;Order?&gt; GetOrderAsync(int id, CancellationToken ct = default) =&gt;
+        _db.Orders
+            .AsNoTracking()
+            .Include(o =&gt; o.Customer)
+            .Include(o =&gt; o.OrderDetails)
+                .ThenInclude(d =&gt; d.Product)
+            .FirstOrDefaultAsync(o =&gt; o.Id == id, ct);
+
+    /// &lt;summary&gt;Short, sortable, collision-resistant enough for a single-node demo.&lt;/summary&gt;
+    private static string GenerateOrderNumber() =&gt;
+        $&quot;ORD-{DateTime.UtcNow:yyyyMMdd}-{Guid.NewGuid().ToString(&quot;N&quot;)[..6].ToUpperInvariant()}&quot;;
+}</code></pre>
+
+
+<h3 id="step21">Step 21: Create Services\ProcessedOrderService.cs</h3>
+<p>The read side for PostgreSQL, serving both the Processed Orders screen and the Accepted and
+Rejected screen.</p>
+<p>It catches database errors and returns a view model carrying a <code>DataError</code> string
+rather than letting the exception become a 500. That way a PostgreSQL outage renders as an
+explanatory banner on an otherwise working page, which is consistent with how Redis failures are
+handled.</p>
+<pre class="code" data-lang="csharp"><code>using Microsoft.EntityFrameworkCore;
+using MVC_HealthCheck.Data;
+using MVC_HealthCheck.Models;
+using MVC_HealthCheck.ViewModels;
+
+namespace MVC_HealthCheck.Services;
+
+/// &lt;summary&gt;Reads the PostgreSQL outcome table for the Processed and Accepted/Rejected screens.&lt;/summary&gt;
+public sealed class ProcessedOrderService
+{
+    private readonly ProcessedOrdersDbContext _db;
+    private readonly ILogger&lt;ProcessedOrderService&gt; _logger;
+
+    public ProcessedOrderService(ProcessedOrdersDbContext db, ILogger&lt;ProcessedOrderService&gt; logger)
+    {
+        _db = db;
+        _logger = logger;
+    }
+
+    /// &lt;param name=&quot;decision&quot;&gt;null for everything, otherwise &quot;Accepted&quot; or &quot;Rejected&quot;.&lt;/param&gt;
+    public async Task&lt;ProcessedOrdersViewModel&gt; GetAsync(string? decision, CancellationToken ct = default)
+    {
+        try
+        {
+            var all = await _db.ProcessedOrders
+                .AsNoTracking()
+                .OrderByDescending(p =&gt; p.ProcessedOnUtc)
+                .ToListAsync(ct);
+
+            var filtered = string.IsNullOrWhiteSpace(decision)
+                ? all
+                : all.Where(p =&gt; string.Equals(p.Decision, decision, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            return new ProcessedOrdersViewModel
+            {
+                ProcessedOrders = filtered,
+                Decision = decision,
+                AcceptedCount = all.Count(p =&gt; p.IsAccepted),
+                RejectedCount = all.Count(p =&gt; !p.IsAccepted),
+                AcceptedValue = all.Where(p =&gt; p.IsAccepted).Sum(p =&gt; p.TotalAmount),
+                RejectedValue = all.Where(p =&gt; !p.IsAccepted).Sum(p =&gt; p.TotalAmount)
+            };
+        }
+        catch (Exception ex)
+        {
+            // PostgreSQL being down is already reported by /health; the screen should say so
+            // rather than return a 500.
+            _logger.LogError(ex, &quot;Could not read processed orders from PostgreSQL.&quot;);
+            return new ProcessedOrdersViewModel
+            {
+                Decision = decision,
+                DataError = $&quot;PostgreSQL is not reachable: {ex.Message}&quot;
+            };
+        }
+    }
+
+    public async Task&lt;ProcessedOrder?&gt; GetByOrderIdAsync(int orderId, CancellationToken ct = default)
+    {
+        try
+        {
+            return await _db.ProcessedOrders.AsNoTracking().FirstOrDefaultAsync(p =&gt; p.OrderId == orderId, ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, &quot;Could not read processed order for order {OrderId}.&quot;, orderId);
+            return null;
+        }
+    }
+}</code></pre>
+
+
+<h3 id="step22">Step 22: Create ViewModels\OrderViewModels.cs</h3>
+<p>The view models for all four screens, kept in one file because they are small and closely
+related.</p>
+<p><code>CreateOrderViewModel</code> implements <code>IValidatableObject</code> to express a rule
+that attributes cannot: the order needs at least one product line. Attribute validation works
+property by property, so a cross property or collection level rule needs
+<code>Validate</code>.</p>
+<pre class="code" data-lang="csharp"><code>using System.ComponentModel.DataAnnotations;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using MVC_HealthCheck.Models;
+using MVC_HealthCheck.Services;
+
+namespace MVC_HealthCheck.ViewModels;
+
+/// &lt;summary&gt;One product line on the create-order form.&lt;/summary&gt;
+public class OrderLineInput
+{
+    [Display(Name = &quot;Product&quot;)]
+    public int ProductId { get; set; }
+
+    [Display(Name = &quot;Quantity&quot;)]
+    [Range(1, 10_000, ErrorMessage = &quot;Quantity must be between 1 and 10,000.&quot;)]
+    public int Quantity { get; set; } = 1;
+}
+
+/// &lt;summary&gt;Backs the Create Order screen.&lt;/summary&gt;
+public class CreateOrderViewModel : IValidatableObject
+{
+    [Display(Name = &quot;Customer&quot;)]
+    [Range(1, int.MaxValue, ErrorMessage = &quot;Please choose a customer.&quot;)]
+    public int CustomerId { get; set; }
+
+    [Display(Name = &quot;Advance Paid&quot;)]
+    [Range(0, 100_000_000, ErrorMessage = &quot;Advance must be zero or more.&quot;)]
+    [DataType(DataType.Currency)]
+    public decimal AdvanceAmount { get; set; }
+
+    public List&lt;OrderLineInput&gt; Items { get; set; } = [new OrderLineInput()];
+
+    // Populated by the controller for the dropdowns.
+    public IEnumerable&lt;SelectListItem&gt; CustomerOptions { get; set; } = [];
+    public IEnumerable&lt;Product&gt; Products { get; set; } = [];
+
+    public IEnumerable&lt;ValidationResult&gt; Validate(ValidationContext validationContext)
+    {
+        if (Items is null || Items.All(i =&gt; i.ProductId &lt;= 0))
+        {
+            yield return new ValidationResult(
+                &quot;Add at least one product line.&quot;, [nameof(Items)]);
+        }
+    }
+}
+
+/// &lt;summary&gt;Backs the Order Status screen (SQL Server side of the pipeline).&lt;/summary&gt;
+public class OrderStatusViewModel
+{
+    public IReadOnlyList&lt;Order&gt; Orders { get; init; } = [];
+    public OrderStatus? Filter { get; init; }
+    public OrderCacheCounters Counters { get; init; } = new();
+    public bool CacheAvailable { get; init; }
+}
+
+/// &lt;summary&gt;Backs both the Processed Orders screen and the Accepted/Rejected screen (PostgreSQL side).&lt;/summary&gt;
+public class ProcessedOrdersViewModel
+{
+    public IReadOnlyList&lt;ProcessedOrder&gt; ProcessedOrders { get; init; } = [];
+
+    /// &lt;summary&gt;null = all, &quot;Accepted&quot;, or &quot;Rejected&quot;.&lt;/summary&gt;
+    public string? Decision { get; init; }
+
+    public int AcceptedCount { get; init; }
+    public int RejectedCount { get; init; }
+    public decimal AcceptedValue { get; init; }
+    public decimal RejectedValue { get; init; }
+
+    /// &lt;summary&gt;Set when PostgreSQL could not be reached, so the view can explain the empty table.&lt;/summary&gt;
+    public string? DataError { get; init; }
+}
+
+/// &lt;summary&gt;Backs the dashboard, which is driven mostly by the Redis activity lists.&lt;/summary&gt;
+public class DashboardViewModel
+{
+    public OrderCacheCounters Counters { get; init; } = new();
+    public IReadOnlyList&lt;OrderCacheEntry&gt; RecentReceived { get; init; } = [];
+    public IReadOnlyList&lt;OrderCacheEntry&gt; RecentProcessed { get; init; } = [];
+    public bool CacheAvailable { get; init; }
+    public int PendingInPipeline { get; init; }
+}</code></pre>
+
+
+<h3 id="step23">Step 23: Create HealthChecks\HealthCheckResponseWriter.cs</h3>
+<p>By default, <code>MapHealthChecks</code> writes a plain text body containing a single word:
+<code>Healthy</code> or <code>Unhealthy</code>. That is enough for a load balancer, which only
+reads the status code, but it is useless to a human trying to work out which dependency broke.</p>
+<p>This writer replaces that body with indented JSON naming every check, its status, how long it
+took and any error message. It is wired up through the <code>ResponseWriter</code> property of
+<code>HealthCheckOptions</code>.</p>
+<p>One security note on this class. It writes <code>entry.Value.Exception?.Message</code> and not
+the full exception. A stack trace on an endpoint that is often reachable from outside the cluster
+leaks file paths, library versions and internal structure. The message alone is enough to
+diagnose, and in a system exposed to the internet you would go further and keep the detailed
+variant behind authentication.</p>
+<pre class="code" data-lang="csharp"><code>using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+
+namespace MVC_HealthCheck.HealthChecks;
+
+/// &lt;summary&gt;
+/// Writes a readable JSON document for the /health endpoint instead of the default
+/// plain-text &quot;Healthy&quot; body, so an outage names the dependency that caused it.
+/// &lt;/summary&gt;
+public static class HealthCheckResponseWriter
+{
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
+    public static Task WriteAsync(HttpContext context, HealthReport report)
+    {
+        context.Response.ContentType = &quot;application/json; charset=utf-8&quot;;
+
+        var payload = new
+        {
+            status = report.Status.ToString(),
+            totalDurationMs = Math.Round(report.TotalDuration.TotalMilliseconds, 2),
+            checkedAtUtc = DateTime.UtcNow,
+            entries = report.Entries.Select(entry =&gt; new
+            {
+                name = entry.Key,
+                status = entry.Value.Status.ToString(),
+                description = entry.Value.Description,
+                durationMs = Math.Round(entry.Value.Duration.TotalMilliseconds, 2),
+                tags = entry.Value.Tags,
+                // Only the message: a full stack trace on a public endpoint leaks internals.
+                error = entry.Value.Exception?.Message,
+                data = entry.Value.Data.Count == 0 ? null : entry.Value.Data
+            })
+        };
+
+        return context.Response.WriteAsync(JsonSerializer.Serialize(payload, JsonOptions));
+    }
+}</code></pre>
+
+
+<h3 id="step24">Step 24: Create Controllers\OrdersController.cs</h3>
+<p>The controller for all four required screens, plus a details view.</p>
+<p>The <code>Decisions</code> action is the one worth a second look. It does not pass the query
+string straight to the service. It maps it through a <code>switch</code> expression that accepts
+only "accepted" or "rejected" and turns anything else into <code>null</code>, meaning no filter.
+Normalising untrusted input to a known set before it reaches the data layer is cheap and removes
+a whole class of problem.</p>
+<p><code>Create</code> is split into a GET that renders an empty form and a POST marked
+<code>[ValidateAntiForgeryToken]</code>. On a validation failure it repopulates the dropdown
+lookups before redisplaying the view, which is easy to forget and produces an empty product list
+on the second attempt.</p>
+<pre class="code" data-lang="csharp"><code>using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Rendering;
+using MVC_HealthCheck.Models;
+using MVC_HealthCheck.Services;
+using MVC_HealthCheck.ViewModels;
+
+namespace MVC_HealthCheck.Controllers;
+
+public class OrdersController : Controller
+{
+    private readonly OrderService _orders;
+    private readonly ProcessedOrderService _processed;
+    private readonly IOrderCache _cache;
+    private readonly ILogger&lt;OrdersController&gt; _logger;
+
+    public OrdersController(
+        OrderService orders,
+        ProcessedOrderService processed,
+        IOrderCache cache,
+        ILogger&lt;OrdersController&gt; logger)
+    {
+        _orders = orders;
+        _processed = processed;
+        _cache = cache;
+        _logger = logger;
+    }
+
+    // ---------------------------------------------------------------- Create Orders ----------
+
+    [HttpGet]
+    public async Task&lt;IActionResult&gt; Create(CancellationToken ct)
+    {
+        var model = new CreateOrderViewModel();
+        await PopulateLookupsAsync(model, ct);
+        return View(model);
+    }
+
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    public async Task&lt;IActionResult&gt; Create(CreateOrderViewModel model, CancellationToken ct)
+    {
+        if (!ModelState.IsValid)
+        {
+            await PopulateLookupsAsync(model, ct);
+            return View(model);
+        }
+
+        try
+        {
+            var order = await _orders.CreateOrderAsync(model, ct);
+
+            TempData[&quot;Flash&quot;] = order.Status == OrderStatus.Failed
+                ? $&quot;Order {order.OrderNumber} was saved but could not be queued. See its status for details.&quot;
+                : $&quot;Order {order.OrderNumber} was created and queued for processing.&quot;;
+            TempData[&quot;FlashKind&quot;] = order.Status == OrderStatus.Failed ? &quot;warning&quot; : &quot;success&quot;;
+
+            return RedirectToAction(nameof(Status));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, &quot;Order creation failed.&quot;);
+            ModelState.AddModelError(string.Empty, ex.Message);
+            await PopulateLookupsAsync(model, ct);
+            return View(model);
+        }
+    }
+
+    // ------------------------------------------------------------- Checking Order Status -----
+
+    [HttpGet]
+    public async Task&lt;IActionResult&gt; Status(OrderStatus? status, CancellationToken ct)
+    {
+        var model = new OrderStatusViewModel
+        {
+            Orders = await _orders.GetOrdersAsync(status, ct),
+            Filter = status,
+            Counters = await _cache.GetCountersAsync(ct),
+            CacheAvailable = _cache.IsAvailable
+        };
+
+        return View(model);
+    }
+
+    [HttpGet]
+    public async Task&lt;IActionResult&gt; Details(int id, CancellationToken ct)
+    {
+        var order = await _orders.GetOrderAsync(id, ct);
+        if (order is null)
+        {
+            return NotFound();
+        }
+
+        ViewBag.Processed = await _processed.GetByOrderIdAsync(id, ct);
+        return View(order);
+    }
+
+    // ------------------------------------------------------------ Viewing Processed Orders ---
+
+    [HttpGet]
+    public async Task&lt;IActionResult&gt; Processed(CancellationToken ct)
+    {
+        var model = await _processed.GetAsync(decision: null, ct);
+        return View(model);
+    }
+
+    // ------------------------------------------------------- Viewing Accepted and Rejected ---
+
+    [HttpGet]
+    public async Task&lt;IActionResult&gt; Decisions(string? decision, CancellationToken ct)
+    {
+        // Guard the filter so an arbitrary query string cannot reach the database.
+        var normalised = decision?.Trim().ToLowerInvariant() switch
+        {
+            &quot;accepted&quot; =&gt; &quot;Accepted&quot;,
+            &quot;rejected&quot; =&gt; &quot;Rejected&quot;,
+            _ =&gt; null
+        };
+
+        var model = await _processed.GetAsync(normalised, ct);
+        return View(model);
+    }
+
+    private async Task PopulateLookupsAsync(CreateOrderViewModel model, CancellationToken ct)
+    {
+        var customers = await _orders.GetCustomersAsync(ct);
+        model.CustomerOptions = customers.Select(c =&gt; new SelectListItem
+        {
+            Value = c.Id.ToString(),
+            Text = $&quot;{c.Name} ({c.City})&quot;,
+            Selected = c.Id == model.CustomerId
+        });
+
+        model.Products = await _orders.GetProductsAsync(ct);
+
+        if (model.Items.Count == 0)
+        {
+            model.Items.Add(new OrderLineInput());
+        }
+    }
+}</code></pre>
+
+
+<h3 id="step25">Step 25: Create Controllers\HomeController.cs</h3>
+<p>The dashboard controller. The interesting line is the injection of
+<code>HealthCheckService</code>.</p>
+<p>That is the same service behind the <code>/health</code> endpoint, and it can be called
+directly from application code. The dashboard runs
+<code>CheckHealthAsync</code> in process and renders the resulting
+<code>HealthReport</code>, so the home page shows dependency health without making an HTTP call
+back to itself.</p>
+<pre class="code" data-lang="csharp"><code>using System.Diagnostics;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using MVC_HealthCheck.Models;
+using MVC_HealthCheck.Services;
+using MVC_HealthCheck.ViewModels;
+
+namespace MVC_HealthCheck.Controllers;
+
+public class HomeController : Controller
+{
+    private readonly IOrderCache _cache;
+    private readonly OrderService _orders;
+    private readonly HealthCheckService _healthChecks;
+
+    public HomeController(IOrderCache cache, OrderService orders, HealthCheckService healthChecks)
+    {
+        _cache = cache;
+        _orders = orders;
+        _healthChecks = healthChecks;
+    }
+
+    public async Task&lt;IActionResult&gt; Index(CancellationToken ct)
+    {
+        // Run the registered health checks in-process so the dashboard can render the same
+        // results that /health returns, without an extra HTTP hop.
+        ViewBag.Health = await _healthChecks.CheckHealthAsync(ct);
+
+        var received = await _cache.GetReceivedAsync(10, ct);
+        var processed = await _cache.GetProcessedAsync(10, ct);
+
+        var pending = (await _orders.GetOrdersAsync(OrderStatus.Queued, ct)).Count
+                      + (await _orders.GetOrdersAsync(OrderStatus.Processing, ct)).Count;
+
+        return View(new DashboardViewModel
+        {
+            Counters = await _cache.GetCountersAsync(ct),
+            RecentReceived = received,
+            RecentProcessed = processed,
+            CacheAvailable = _cache.IsAvailable,
+            PendingInPipeline = pending
+        });
+    }
+
+    public IActionResult Privacy() =&gt; View();
+
+    [ResponseCache(Duration = 0, Location = ResponseCacheLocation.None, NoStore = true)]
+    public IActionResult Error() =&gt;
+        View(new ErrorViewModel { RequestId = Activity.Current?.Id ?? HttpContext.TraceIdentifier });
+}</code></pre>
+
+
+<h3 id="step26">Step 26: Create Views\_ViewImports.cshtml</h3>
+<p>Adding the <code>Microsoft.Extensions.Diagnostics.HealthChecks</code> namespace here is what
+lets the dashboard view refer to <code>HealthReport</code> and <code>HealthStatus</code> without
+a fully qualified name.</p>
+<pre class="code" data-lang="cshtml"><code>@using MVC_HealthCheck
+@using MVC_HealthCheck.Models
+@using MVC_HealthCheck.Services
+@using MVC_HealthCheck.ViewModels
+@using Microsoft.Extensions.Diagnostics.HealthChecks
+@addTagHelper *, Microsoft.AspNetCore.Mvc.TagHelpers</code></pre>
+
+
+<h3 id="step27">Step 27: Create Views\Shared\_Layout.cshtml</h3>
+<p>The shared layout, carrying the navigation for the four screens and direct links to the raw
+<code>/health</code> JSON and the Health UI. It also renders the TempData flash message set by
+the controller after a successful post.</p>
+<pre class="code" data-lang="cshtml"><code>&lt;!DOCTYPE html&gt;
+&lt;html lang=&quot;en&quot;&gt;
+&lt;head&gt;
+    &lt;meta charset=&quot;utf-8&quot; /&gt;
+    &lt;meta name=&quot;viewport&quot; content=&quot;width=device-width, initial-scale=1.0&quot; /&gt;
+    &lt;title&gt;@ViewData[&quot;Title&quot;] - Order Processing&lt;/title&gt;
+    &lt;script type=&quot;importmap&quot;&gt;&lt;/script&gt;
+    &lt;link rel=&quot;stylesheet&quot; href=&quot;~/lib/bootstrap/dist/css/bootstrap.min.css&quot; /&gt;
+    &lt;link rel=&quot;stylesheet&quot; href=&quot;~/css/site.css&quot; asp-append-version=&quot;true&quot; /&gt;
+    &lt;link rel=&quot;stylesheet&quot; href=&quot;~/MVC_HealthCheck.styles.css&quot; asp-append-version=&quot;true&quot; /&gt;
+&lt;/head&gt;
+&lt;body&gt;
+    &lt;header&gt;
+        &lt;nav class=&quot;navbar navbar-expand-lg navbar-dark bg-dark border-bottom box-shadow mb-4&quot;&gt;
+            &lt;div class=&quot;container-fluid&quot;&gt;
+                &lt;a class=&quot;navbar-brand fw-semibold&quot; asp-controller=&quot;Home&quot; asp-action=&quot;Index&quot;&gt;
+                    Order Processing
+                &lt;/a&gt;
+                &lt;button class=&quot;navbar-toggler&quot; type=&quot;button&quot; data-bs-toggle=&quot;collapse&quot; data-bs-target=&quot;.navbar-collapse&quot;
+                        aria-controls=&quot;navbarSupportedContent&quot; aria-expanded=&quot;false&quot; aria-label=&quot;Toggle navigation&quot;&gt;
+                    &lt;span class=&quot;navbar-toggler-icon&quot;&gt;&lt;/span&gt;
+                &lt;/button&gt;
+                &lt;div class=&quot;navbar-collapse collapse d-lg-inline-flex justify-content-between&quot;&gt;
+                    &lt;ul class=&quot;navbar-nav flex-grow-1&quot;&gt;
+                        &lt;li class=&quot;nav-item&quot;&gt;
+                            &lt;a class=&quot;nav-link&quot; asp-controller=&quot;Home&quot; asp-action=&quot;Index&quot;&gt;Dashboard&lt;/a&gt;
+                        &lt;/li&gt;
+                        &lt;li class=&quot;nav-item&quot;&gt;
+                            &lt;a class=&quot;nav-link&quot; asp-controller=&quot;Orders&quot; asp-action=&quot;Create&quot;&gt;Create Order&lt;/a&gt;
+                        &lt;/li&gt;
+                        &lt;li class=&quot;nav-item&quot;&gt;
+                            &lt;a class=&quot;nav-link&quot; asp-controller=&quot;Orders&quot; asp-action=&quot;Status&quot;&gt;Order Status&lt;/a&gt;
+                        &lt;/li&gt;
+                        &lt;li class=&quot;nav-item&quot;&gt;
+                            &lt;a class=&quot;nav-link&quot; asp-controller=&quot;Orders&quot; asp-action=&quot;Processed&quot;&gt;Processed Orders&lt;/a&gt;
+                        &lt;/li&gt;
+                        &lt;li class=&quot;nav-item&quot;&gt;
+                            &lt;a class=&quot;nav-link&quot; asp-controller=&quot;Orders&quot; asp-action=&quot;Decisions&quot;&gt;Accepted / Rejected&lt;/a&gt;
+                        &lt;/li&gt;
+                    &lt;/ul&gt;
+                    &lt;ul class=&quot;navbar-nav&quot;&gt;
+                        &lt;li class=&quot;nav-item&quot;&gt;
+                            &lt;a class=&quot;nav-link&quot; href=&quot;/health&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;/health JSON&lt;/a&gt;
+                        &lt;/li&gt;
+                        &lt;li class=&quot;nav-item&quot;&gt;
+                            &lt;a class=&quot;nav-link&quot; href=&quot;/health-ui&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;Health UI&lt;/a&gt;
+                        &lt;/li&gt;
+                    &lt;/ul&gt;
+                &lt;/div&gt;
+            &lt;/div&gt;
+        &lt;/nav&gt;
+    &lt;/header&gt;
+
+    &lt;div class=&quot;container-fluid px-4&quot;&gt;
+        &lt;main role=&quot;main&quot; class=&quot;pb-3&quot;&gt;
+            @if (TempData[&quot;Flash&quot;] is string flash &amp;&amp; !string.IsNullOrWhiteSpace(flash))
+            {
+                var kind = TempData[&quot;FlashKind&quot;] as string ?? &quot;success&quot;;
+                &lt;div class=&quot;alert alert-@kind alert-dismissible fade show&quot; role=&quot;alert&quot;&gt;
+                    @flash
+                    &lt;button type=&quot;button&quot; class=&quot;btn-close&quot; data-bs-dismiss=&quot;alert&quot; aria-label=&quot;Close&quot;&gt;&lt;/button&gt;
+                &lt;/div&gt;
+            }
+            @RenderBody()
+        &lt;/main&gt;
+    &lt;/div&gt;
+
+    &lt;footer class=&quot;border-top footer text-muted mt-4&quot;&gt;
+        &lt;div class=&quot;container-fluid px-4&quot;&gt;
+            SQL Server &amp;rarr; RabbitMQ &amp;rarr; Background Worker &amp;rarr; PostgreSQL, with Redis for live activity.
+        &lt;/div&gt;
+    &lt;/footer&gt;
+
+    &lt;script src=&quot;~/lib/jquery/dist/jquery.min.js&quot;&gt;&lt;/script&gt;
+    &lt;script src=&quot;~/lib/bootstrap/dist/js/bootstrap.bundle.min.js&quot;&gt;&lt;/script&gt;
+    &lt;script src=&quot;~/js/site.js&quot; asp-append-version=&quot;true&quot;&gt;&lt;/script&gt;
+    @await RenderSectionAsync(&quot;Scripts&quot;, required: false)
+&lt;/body&gt;
+&lt;/html&gt;</code></pre>
+
+
+<h3 id="step28">Step 28: Create Views\Home\Index.cshtml</h3>
+<p>The dashboard. The top card iterates <code>HealthReport.Entries</code> and renders one tile
+per dependency, mapping <code>HealthStatus</code> to a Bootstrap colour through a local
+function.</p>
+<p>Below that are the Redis counters and the two activity lists. When
+<code>Model.CacheAvailable</code> is false the view explains that the lists are empty because
+Redis is unreachable, which is the user facing half of the degradation strategy.</p>
+<pre class="code" data-lang="cshtml"><code>@model DashboardViewModel
+@{
+    ViewData[&quot;Title&quot;] = &quot;Dashboard&quot;;
+    var report = ViewBag.Health as HealthReport;
+
+    string BadgeFor(HealthStatus s) =&gt; s switch
+    {
+        HealthStatus.Healthy =&gt; &quot;success&quot;,
+        HealthStatus.Degraded =&gt; &quot;warning&quot;,
+        _ =&gt; &quot;danger&quot;
+    };
+}
+
+&lt;div class=&quot;d-flex justify-content-between align-items-center mb-3&quot;&gt;
+    &lt;h1 class=&quot;h3 mb-0&quot;&gt;Order Processing Dashboard&lt;/h1&gt;
+    &lt;div&gt;
+        &lt;a class=&quot;btn btn-sm btn-outline-secondary&quot; asp-controller=&quot;Home&quot; asp-action=&quot;Index&quot;&gt;Refresh&lt;/a&gt;
+        &lt;a class=&quot;btn btn-sm btn-primary&quot; asp-controller=&quot;Orders&quot; asp-action=&quot;Create&quot;&gt;Create Order&lt;/a&gt;
+    &lt;/div&gt;
+&lt;/div&gt;
+
+&lt;!-- ------------------------------------------------------------------ dependency health --&gt;
+&lt;div class=&quot;card mb-4&quot;&gt;
+    &lt;div class=&quot;card-header d-flex justify-content-between align-items-center&quot;&gt;
+        &lt;span class=&quot;fw-semibold&quot;&gt;Dependency Health&lt;/span&gt;
+        @if (report is not null)
+        {
+            &lt;span class=&quot;badge bg-@BadgeFor(report.Status)&quot;&gt;
+                Overall: @report.Status (@report.TotalDuration.TotalMilliseconds.ToString(&quot;0&quot;) ms)
+            &lt;/span&gt;
+        }
+    &lt;/div&gt;
+    &lt;div class=&quot;card-body&quot;&gt;
+        @if (report is null)
+        {
+            &lt;p class=&quot;text-muted mb-0&quot;&gt;Health report unavailable.&lt;/p&gt;
+        }
+        else
+        {
+            &lt;div class=&quot;row g-3&quot;&gt;
+                @foreach (var entry in report.Entries.OrderBy(e =&gt; e.Key))
+                {
+                    &lt;div class=&quot;col-12 col-md-6 col-xl-3&quot;&gt;
+                        &lt;div class=&quot;border rounded p-3 h-100 border-@BadgeFor(entry.Value.Status)&quot;&gt;
+                            &lt;div class=&quot;d-flex justify-content-between align-items-start&quot;&gt;
+                                &lt;span class=&quot;fw-semibold text-uppercase small&quot;&gt;@entry.Key&lt;/span&gt;
+                                &lt;span class=&quot;badge bg-@BadgeFor(entry.Value.Status)&quot;&gt;@entry.Value.Status&lt;/span&gt;
+                            &lt;/div&gt;
+                            &lt;div class=&quot;small text-muted mt-2&quot;&gt;
+                                @entry.Value.Duration.TotalMilliseconds.ToString(&quot;0&quot;) ms
+                            &lt;/div&gt;
+                            @if (entry.Value.Exception is not null)
+                            {
+                                &lt;div class=&quot;small text-danger mt-2 text-break&quot;&gt;@entry.Value.Exception.Message&lt;/div&gt;
+                            }
+                        &lt;/div&gt;
+                    &lt;/div&gt;
+                }
+            &lt;/div&gt;
+        }
+    &lt;/div&gt;
+    &lt;div class=&quot;card-footer small text-muted&quot;&gt;
+        Probed by AspNetCore.Diagnostics.HealthChecks. Raw JSON at
+        &lt;a href=&quot;/health&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;/health&lt;/a&gt;,
+        readiness at &lt;a href=&quot;/health/ready&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;/health/ready&lt;/a&gt;,
+        polling UI at &lt;a href=&quot;/health-ui&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;/health-ui&lt;/a&gt;.
+    &lt;/div&gt;
+&lt;/div&gt;
+
+&lt;!-- ---------------------------------------------------------------------- redis counters --&gt;
+@if (!Model.CacheAvailable)
+{
+    &lt;div class=&quot;alert alert-warning&quot;&gt;
+        Redis is not reachable, so the counters and activity lists below are empty.
+        Orders are still captured in SQL Server.
+    &lt;/div&gt;
+}
+
+&lt;div class=&quot;row g-3 mb-4&quot;&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;
+        &lt;div class=&quot;card text-bg-primary h-100&quot;&gt;
+            &lt;div class=&quot;card-body&quot;&gt;
+                &lt;div class=&quot;small text-uppercase&quot;&gt;Received&lt;/div&gt;
+                &lt;div class=&quot;display-6&quot;&gt;@Model.Counters.Received&lt;/div&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;
+        &lt;div class=&quot;card text-bg-secondary h-100&quot;&gt;
+            &lt;div class=&quot;card-body&quot;&gt;
+                &lt;div class=&quot;small text-uppercase&quot;&gt;Processed&lt;/div&gt;
+                &lt;div class=&quot;display-6&quot;&gt;@Model.Counters.Processed&lt;/div&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;
+        &lt;div class=&quot;card text-bg-success h-100&quot;&gt;
+            &lt;div class=&quot;card-body&quot;&gt;
+                &lt;div class=&quot;small text-uppercase&quot;&gt;Accepted&lt;/div&gt;
+                &lt;div class=&quot;display-6&quot;&gt;@Model.Counters.Accepted&lt;/div&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;
+        &lt;div class=&quot;card text-bg-danger h-100&quot;&gt;
+            &lt;div class=&quot;card-body&quot;&gt;
+                &lt;div class=&quot;small text-uppercase&quot;&gt;Rejected&lt;/div&gt;
+                &lt;div class=&quot;display-6&quot;&gt;@Model.Counters.Rejected&lt;/div&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+    &lt;/div&gt;
+&lt;/div&gt;
+
+@if (Model.PendingInPipeline &gt; 0)
+{
+    &lt;div class=&quot;alert alert-info&quot;&gt;
+        @Model.PendingInPipeline order(s) are queued or being processed right now. Refresh in a moment.
+    &lt;/div&gt;
+}
+
+&lt;!-- --------------------------------------------------------------- redis activity lists --&gt;
+&lt;div class=&quot;row g-4&quot;&gt;
+    &lt;div class=&quot;col-12 col-xl-6&quot;&gt;
+        &lt;div class=&quot;card h-100&quot;&gt;
+            &lt;div class=&quot;card-header fw-semibold&quot;&gt;Received Orders &lt;span class=&quot;text-muted small&quot;&gt;(Redis)&lt;/span&gt;&lt;/div&gt;
+            &lt;div class=&quot;table-responsive&quot;&gt;
+                &lt;table class=&quot;table table-sm table-striped mb-0&quot;&gt;
+                    &lt;thead&gt;
+                        &lt;tr&gt;
+                            &lt;th&gt;Order&lt;/th&gt;
+                            &lt;th&gt;Customer&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;Total&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;Advance&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;%&lt;/th&gt;
+                            &lt;th&gt;At (UTC)&lt;/th&gt;
+                        &lt;/tr&gt;
+                    &lt;/thead&gt;
+                    &lt;tbody&gt;
+                        @if (Model.RecentReceived.Count == 0)
+                        {
+                            &lt;tr&gt;&lt;td colspan=&quot;6&quot; class=&quot;text-center text-muted py-3&quot;&gt;No orders received yet.&lt;/td&gt;&lt;/tr&gt;
+                        }
+                        @foreach (var e in Model.RecentReceived)
+                        {
+                            &lt;tr&gt;
+                                &lt;td&gt;&lt;a asp-controller=&quot;Orders&quot; asp-action=&quot;Details&quot; asp-route-id=&quot;@e.OrderId&quot;&gt;@e.OrderNumber&lt;/a&gt;&lt;/td&gt;
+                                &lt;td&gt;@e.CustomerName&lt;/td&gt;
+                                &lt;td class=&quot;text-end&quot;&gt;@e.TotalAmount.ToString(&quot;N2&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;text-end&quot;&gt;@e.AdvanceAmount.ToString(&quot;N2&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;text-end&quot;&gt;@e.AdvancePercentage.ToString(&quot;0.##&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;small&quot;&gt;@e.TimestampUtc.ToString(&quot;HH:mm:ss&quot;)&lt;/td&gt;
+                            &lt;/tr&gt;
+                        }
+                    &lt;/tbody&gt;
+                &lt;/table&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+    &lt;/div&gt;
+
+    &lt;div class=&quot;col-12 col-xl-6&quot;&gt;
+        &lt;div class=&quot;card h-100&quot;&gt;
+            &lt;div class=&quot;card-header fw-semibold&quot;&gt;Processed Orders &lt;span class=&quot;text-muted small&quot;&gt;(Redis)&lt;/span&gt;&lt;/div&gt;
+            &lt;div class=&quot;table-responsive&quot;&gt;
+                &lt;table class=&quot;table table-sm table-striped mb-0&quot;&gt;
+                    &lt;thead&gt;
+                        &lt;tr&gt;
+                            &lt;th&gt;Order&lt;/th&gt;
+                            &lt;th&gt;Customer&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;Total&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;%&lt;/th&gt;
+                            &lt;th&gt;Decision&lt;/th&gt;
+                            &lt;th&gt;At (UTC)&lt;/th&gt;
+                        &lt;/tr&gt;
+                    &lt;/thead&gt;
+                    &lt;tbody&gt;
+                        @if (Model.RecentProcessed.Count == 0)
+                        {
+                            &lt;tr&gt;&lt;td colspan=&quot;6&quot; class=&quot;text-center text-muted py-3&quot;&gt;Nothing processed yet.&lt;/td&gt;&lt;/tr&gt;
+                        }
+                        @foreach (var e in Model.RecentProcessed)
+                        {
+                            &lt;tr&gt;
+                                &lt;td&gt;&lt;a asp-controller=&quot;Orders&quot; asp-action=&quot;Details&quot; asp-route-id=&quot;@e.OrderId&quot;&gt;@e.OrderNumber&lt;/a&gt;&lt;/td&gt;
+                                &lt;td&gt;@e.CustomerName&lt;/td&gt;
+                                &lt;td class=&quot;text-end&quot;&gt;@e.TotalAmount.ToString(&quot;N2&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;text-end&quot;&gt;@e.AdvancePercentage.ToString(&quot;0.##&quot;)&lt;/td&gt;
+                                &lt;td&gt;
+                                    &lt;span class=&quot;badge bg-@(e.Status == &quot;Accepted&quot; ? &quot;success&quot; : &quot;danger&quot;)&quot;&gt;@e.Status&lt;/span&gt;
+                                &lt;/td&gt;
+                                &lt;td class=&quot;small&quot;&gt;@e.TimestampUtc.ToString(&quot;HH:mm:ss&quot;)&lt;/td&gt;
+                            &lt;/tr&gt;
+                        }
+                    &lt;/tbody&gt;
+                &lt;/table&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+    &lt;/div&gt;
+&lt;/div&gt;</code></pre>
+
+
+<h3 id="step29">Step 29: Create Views\Orders\Create.cshtml</h3>
+<p>The Create Order screen, and the most involved view in the application.</p>
+<p>Order lines are rendered in an indexed loop producing names like
+<code>Items[0].ProductId</code>, which is the format the MVC model binder expects for a
+collection. The JavaScript at the bottom adds and removes rows, and its <code>reindex</code>
+function renumbers every row after each change. That renumbering is not cosmetic: the model
+binder stops at the first gap in the sequence, so deleting row 1 without reindexing would make
+the binder silently ignore every line after it.</p>
+<p>The advance meter recalculates on every input event and tells the user, before they submit,
+whether the order will be accepted or rejected. It is a preview of the rule the background worker
+will apply, not the rule itself. The server recomputes the decision independently.</p>
+<pre class="code" data-lang="cshtml"><code>@model CreateOrderViewModel
+@{
+    ViewData[&quot;Title&quot;] = &quot;Create Order&quot;;
+}
+
+&lt;h1 class=&quot;h3 mb-3&quot;&gt;Create Order&lt;/h1&gt;
+
+&lt;div asp-validation-summary=&quot;All&quot; class=&quot;text-danger mb-3&quot;&gt;&lt;/div&gt;
+
+&lt;form asp-action=&quot;Create&quot; method=&quot;post&quot; id=&quot;orderForm&quot;&gt;
+    @Html.AntiForgeryToken()
+
+    &lt;div class=&quot;row g-4&quot;&gt;
+        &lt;div class=&quot;col-12 col-lg-8&quot;&gt;
+            &lt;div class=&quot;card mb-3&quot;&gt;
+                &lt;div class=&quot;card-header fw-semibold&quot;&gt;Customer&lt;/div&gt;
+                &lt;div class=&quot;card-body&quot;&gt;
+                    &lt;label asp-for=&quot;CustomerId&quot; class=&quot;form-label&quot;&gt;&lt;/label&gt;
+                    &lt;select asp-for=&quot;CustomerId&quot; asp-items=&quot;Model.CustomerOptions&quot; class=&quot;form-select&quot;&gt;
+                        &lt;option value=&quot;&quot;&gt;-- choose a customer --&lt;/option&gt;
+                    &lt;/select&gt;
+                    &lt;span asp-validation-for=&quot;CustomerId&quot; class=&quot;text-danger small&quot;&gt;&lt;/span&gt;
+                &lt;/div&gt;
+            &lt;/div&gt;
+
+            &lt;div class=&quot;card&quot;&gt;
+                &lt;div class=&quot;card-header d-flex justify-content-between align-items-center&quot;&gt;
+                    &lt;span class=&quot;fw-semibold&quot;&gt;Products&lt;/span&gt;
+                    &lt;button type=&quot;button&quot; class=&quot;btn btn-sm btn-outline-primary&quot; id=&quot;addLine&quot;&gt;Add line&lt;/button&gt;
+                &lt;/div&gt;
+                &lt;div class=&quot;table-responsive&quot;&gt;
+                    &lt;table class=&quot;table mb-0 align-middle&quot; id=&quot;linesTable&quot;&gt;
+                        &lt;thead&gt;
+                            &lt;tr&gt;
+                                &lt;th style=&quot;width:50%&quot;&gt;Product&lt;/th&gt;
+                                &lt;th style=&quot;width:15%&quot;&gt;Qty&lt;/th&gt;
+                                &lt;th style=&quot;width:15%&quot; class=&quot;text-end&quot;&gt;Unit Price&lt;/th&gt;
+                                &lt;th style=&quot;width:15%&quot; class=&quot;text-end&quot;&gt;Line Total&lt;/th&gt;
+                                &lt;th style=&quot;width:5%&quot;&gt;&lt;/th&gt;
+                            &lt;/tr&gt;
+                        &lt;/thead&gt;
+                        &lt;tbody&gt;
+                            @for (var i = 0; i &lt; Model.Items.Count; i++)
+                            {
+                                &lt;tr class=&quot;order-line&quot;&gt;
+                                    &lt;td&gt;
+                                        &lt;select name=&quot;Items[@i].ProductId&quot; class=&quot;form-select product-select&quot;&gt;
+                                            &lt;option value=&quot;0&quot; data-price=&quot;0&quot;&gt;-- choose a product --&lt;/option&gt;
+                                            @foreach (var p in Model.Products)
+                                            {
+                                                &lt;option value=&quot;@p.Id&quot; data-price=&quot;@p.UnitPrice.ToString(System.Globalization.CultureInfo.InvariantCulture)&quot;
+                                                        selected=&quot;@(Model.Items[i].ProductId == p.Id)&quot;&gt;
+                                                    @p.Name (@p.Sku)
+                                                &lt;/option&gt;
+                                            }
+                                        &lt;/select&gt;
+                                    &lt;/td&gt;
+                                    &lt;td&gt;
+                                        &lt;input name=&quot;Items[@i].Quantity&quot; type=&quot;number&quot; min=&quot;1&quot; step=&quot;1&quot;
+                                               value=&quot;@Model.Items[i].Quantity&quot; class=&quot;form-control qty-input&quot; /&gt;
+                                    &lt;/td&gt;
+                                    &lt;td class=&quot;text-end unit-price&quot;&gt;0.00&lt;/td&gt;
+                                    &lt;td class=&quot;text-end line-total&quot;&gt;0.00&lt;/td&gt;
+                                    &lt;td class=&quot;text-end&quot;&gt;
+                                        &lt;button type=&quot;button&quot; class=&quot;btn btn-sm btn-outline-danger remove-line&quot;&gt;&amp;times;&lt;/button&gt;
+                                    &lt;/td&gt;
+                                &lt;/tr&gt;
+                            }
+                        &lt;/tbody&gt;
+                    &lt;/table&gt;
+                &lt;/div&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+
+        &lt;div class=&quot;col-12 col-lg-4&quot;&gt;
+            &lt;div class=&quot;card&quot;&gt;
+                &lt;div class=&quot;card-header fw-semibold&quot;&gt;Payment&lt;/div&gt;
+                &lt;div class=&quot;card-body&quot;&gt;
+                    &lt;dl class=&quot;row mb-3&quot;&gt;
+                        &lt;dt class=&quot;col-6&quot;&gt;Order Total&lt;/dt&gt;
+                        &lt;dd class=&quot;col-6 text-end fs-5&quot; id=&quot;orderTotal&quot;&gt;0.00&lt;/dd&gt;
+                    &lt;/dl&gt;
+
+                    &lt;label asp-for=&quot;AdvanceAmount&quot; class=&quot;form-label&quot;&gt;&lt;/label&gt;
+                    &lt;input asp-for=&quot;AdvanceAmount&quot; type=&quot;number&quot; step=&quot;0.01&quot; min=&quot;0&quot; class=&quot;form-control&quot; id=&quot;advanceInput&quot; /&gt;
+                    &lt;span asp-validation-for=&quot;AdvanceAmount&quot; class=&quot;text-danger small&quot;&gt;&lt;/span&gt;
+
+                    &lt;div class=&quot;mt-3&quot;&gt;
+                        &lt;div class=&quot;d-flex justify-content-between small&quot;&gt;
+                            &lt;span&gt;Advance as % of total&lt;/span&gt;
+                            &lt;span id=&quot;advancePctLabel&quot;&gt;0%&lt;/span&gt;
+                        &lt;/div&gt;
+                        &lt;div class=&quot;progress mt-1&quot; style=&quot;height:1.25rem&quot;&gt;
+                            &lt;div class=&quot;progress-bar&quot; id=&quot;advanceBar&quot; role=&quot;progressbar&quot; style=&quot;width:0%&quot;&gt;0%&lt;/div&gt;
+                        &lt;/div&gt;
+                        &lt;div class=&quot;form-text&quot; id=&quot;advanceHint&quot;&gt;
+                            The background worker accepts an order when the advance is at least 50% of the total.
+                        &lt;/div&gt;
+                    &lt;/div&gt;
+
+                    &lt;div class=&quot;d-grid gap-2 mt-4&quot;&gt;
+                        &lt;button type=&quot;submit&quot; class=&quot;btn btn-primary&quot;&gt;Place Order&lt;/button&gt;
+                        &lt;a asp-action=&quot;Status&quot; class=&quot;btn btn-outline-secondary&quot;&gt;Cancel&lt;/a&gt;
+                    &lt;/div&gt;
+                &lt;/div&gt;
+            &lt;/div&gt;
+
+            &lt;div class=&quot;alert alert-light border mt-3 small&quot;&gt;
+                The order is written to &lt;strong&gt;SQL Server&lt;/strong&gt;, pushed to &lt;strong&gt;RabbitMQ&lt;/strong&gt;,
+                picked up by the background worker, and the decision is stored in
+                &lt;strong&gt;PostgreSQL&lt;/strong&gt;. Live counts come from &lt;strong&gt;Redis&lt;/strong&gt;.
+            &lt;/div&gt;
+        &lt;/div&gt;
+    &lt;/div&gt;
+&lt;/form&gt;
+
+@section Scripts {
+    &lt;partial name=&quot;_ValidationScriptsPartial&quot; /&gt;
+    &lt;script&gt;
+        (function () {
+            const table = document.querySelector(&#x27;#linesTable tbody&#x27;);
+            const totalEl = document.getElementById(&#x27;orderTotal&#x27;);
+            const advanceInput = document.getElementById(&#x27;advanceInput&#x27;);
+            const advanceBar = document.getElementById(&#x27;advanceBar&#x27;);
+            const advancePctLabel = document.getElementById(&#x27;advancePctLabel&#x27;);
+            const advanceHint = document.getElementById(&#x27;advanceHint&#x27;);
+
+            // Indexes must stay contiguous or the MVC model binder stops at the first gap.
+            function reindex() {
+                table.querySelectorAll(&#x27;tr.order-line&#x27;).forEach(function (row, i) {
+                    const select = row.querySelector(&#x27;.product-select&#x27;);
+                    const qty = row.querySelector(&#x27;.qty-input&#x27;);
+                    select.name = &#x27;Items[&#x27; + i + &#x27;].ProductId&#x27;;
+                    qty.name = &#x27;Items[&#x27; + i + &#x27;].Quantity&#x27;;
+                });
+            }
+
+            function recalc() {
+                let total = 0;
+                table.querySelectorAll(&#x27;tr.order-line&#x27;).forEach(function (row) {
+                    const select = row.querySelector(&#x27;.product-select&#x27;);
+                    const qty = parseInt(row.querySelector(&#x27;.qty-input&#x27;).value, 10) || 0;
+                    const price = parseFloat(select.options[select.selectedIndex].dataset.price) || 0;
+                    const line = price * qty;
+                    row.querySelector(&#x27;.unit-price&#x27;).textContent = price.toFixed(2);
+                    row.querySelector(&#x27;.line-total&#x27;).textContent = line.toFixed(2);
+                    total += line;
+                });
+
+                totalEl.textContent = total.toFixed(2);
+
+                const advance = parseFloat(advanceInput.value) || 0;
+                const pct = total &gt; 0 ? (advance / total) * 100 : 0;
+                const capped = Math.min(pct, 100);
+
+                advancePctLabel.textContent = pct.toFixed(2) + &#x27;%&#x27;;
+                advanceBar.style.width = capped + &#x27;%&#x27;;
+                advanceBar.textContent = pct.toFixed(0) + &#x27;%&#x27;;
+
+                const willAccept = pct &gt;= 50;
+                advanceBar.className = &#x27;progress-bar &#x27; + (willAccept ? &#x27;bg-success&#x27; : &#x27;bg-danger&#x27;);
+                advanceHint.textContent = total &lt;= 0
+                    ? &#x27;Add a product line to see the advance percentage.&#x27;
+                    : (willAccept
+                        ? &#x27;This order will be ACCEPTED (advance is at least 50% of the total).&#x27;
+                        : &#x27;This order will be REJECTED (advance is below 50% of the total).&#x27;);
+                advanceHint.className = &#x27;form-text &#x27; + (total &lt;= 0 ? &#x27;&#x27; : (willAccept ? &#x27;text-success&#x27; : &#x27;text-danger&#x27;));
+            }
+
+            table.addEventListener(&#x27;change&#x27;, recalc);
+            table.addEventListener(&#x27;input&#x27;, recalc);
+            advanceInput.addEventListener(&#x27;input&#x27;, recalc);
+
+            document.getElementById(&#x27;addLine&#x27;).addEventListener(&#x27;click&#x27;, function () {
+                const first = table.querySelector(&#x27;tr.order-line&#x27;);
+                const clone = first.cloneNode(true);
+                clone.querySelector(&#x27;.product-select&#x27;).selectedIndex = 0;
+                clone.querySelector(&#x27;.qty-input&#x27;).value = 1;
+                table.appendChild(clone);
+                reindex();
+                recalc();
+            });
+
+            table.addEventListener(&#x27;click&#x27;, function (e) {
+                if (!e.target.classList.contains(&#x27;remove-line&#x27;)) return;
+                const rows = table.querySelectorAll(&#x27;tr.order-line&#x27;);
+                if (rows.length === 1) return; // always keep one line
+                e.target.closest(&#x27;tr&#x27;).remove();
+                reindex();
+                recalc();
+            });
+
+            recalc();
+        })();
+    &lt;/script&gt;
+}</code></pre>
+
+
+<h3 id="step30">Step 30: Create Views\Orders\Status.cshtml</h3>
+<p>The Checking Order Status screen, reading from SQL Server. It offers a filter button per
+<code>OrderStatus</code> value and shows the Redis counters above the table, so you can watch an
+order move through Received, Queued, Processing and then its final state.</p>
+<pre class="code" data-lang="cshtml"><code>@model OrderStatusViewModel
+@{
+    ViewData[&quot;Title&quot;] = &quot;Order Status&quot;;
+
+    string BadgeFor(OrderStatus s) =&gt; s switch
+    {
+        OrderStatus.Received =&gt; &quot;secondary&quot;,
+        OrderStatus.Queued =&gt; &quot;info&quot;,
+        OrderStatus.Processing =&gt; &quot;primary&quot;,
+        OrderStatus.Accepted =&gt; &quot;success&quot;,
+        OrderStatus.Rejected =&gt; &quot;danger&quot;,
+        _ =&gt; &quot;dark&quot;
+    };
+
+    var statuses = Enum.GetValues&lt;OrderStatus&gt;();
+}
+
+&lt;div class=&quot;d-flex justify-content-between align-items-center mb-3&quot;&gt;
+    &lt;h1 class=&quot;h3 mb-0&quot;&gt;Order Status &lt;span class=&quot;text-muted fs-6&quot;&gt;(SQL Server)&lt;/span&gt;&lt;/h1&gt;
+    &lt;div&gt;
+        &lt;a class=&quot;btn btn-sm btn-outline-secondary&quot; asp-action=&quot;Status&quot; asp-route-status=&quot;@Model.Filter&quot;&gt;Refresh&lt;/a&gt;
+        &lt;a class=&quot;btn btn-sm btn-primary&quot; asp-action=&quot;Create&quot;&gt;Create Order&lt;/a&gt;
+    &lt;/div&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;mb-3&quot;&gt;
+    &lt;a class=&quot;btn btn-sm @(Model.Filter is null ? &quot;btn-dark&quot; : &quot;btn-outline-dark&quot;)&quot; asp-action=&quot;Status&quot;&gt;
+        All (@Model.Orders.Count)
+    &lt;/a&gt;
+    @foreach (var s in statuses)
+    {
+        &lt;a class=&quot;btn btn-sm @(Model.Filter == s ? &quot;btn-&quot; + BadgeFor(s) : &quot;btn-outline-&quot; + BadgeFor(s))&quot;
+           asp-action=&quot;Status&quot; asp-route-status=&quot;@s&quot;&gt;@s&lt;/a&gt;
+    }
+&lt;/div&gt;
+
+@if (!Model.CacheAvailable)
+{
+    &lt;div class=&quot;alert alert-warning py-2 small&quot;&gt;Redis is not reachable, so the counters below read zero.&lt;/div&gt;
+}
+
+&lt;div class=&quot;row g-3 mb-4&quot;&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;&lt;div class=&quot;border rounded p-2&quot;&gt;&lt;div class=&quot;small text-muted&quot;&gt;Received&lt;/div&gt;&lt;div class=&quot;fs-4&quot;&gt;@Model.Counters.Received&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;&lt;div class=&quot;border rounded p-2&quot;&gt;&lt;div class=&quot;small text-muted&quot;&gt;Processed&lt;/div&gt;&lt;div class=&quot;fs-4&quot;&gt;@Model.Counters.Processed&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;&lt;div class=&quot;border rounded p-2&quot;&gt;&lt;div class=&quot;small text-muted&quot;&gt;Accepted&lt;/div&gt;&lt;div class=&quot;fs-4 text-success&quot;&gt;@Model.Counters.Accepted&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;&lt;div class=&quot;border rounded p-2&quot;&gt;&lt;div class=&quot;small text-muted&quot;&gt;Rejected&lt;/div&gt;&lt;div class=&quot;fs-4 text-danger&quot;&gt;@Model.Counters.Rejected&lt;/div&gt;&lt;/div&gt;&lt;/div&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+    &lt;div class=&quot;table-responsive&quot;&gt;
+        &lt;table class=&quot;table table-striped table-hover mb-0 align-middle&quot;&gt;
+            &lt;thead&gt;
+                &lt;tr&gt;
+                    &lt;th&gt;Order #&lt;/th&gt;
+                    &lt;th&gt;Customer&lt;/th&gt;
+                    &lt;th class=&quot;text-center&quot;&gt;Items&lt;/th&gt;
+                    &lt;th class=&quot;text-end&quot;&gt;Total&lt;/th&gt;
+                    &lt;th class=&quot;text-end&quot;&gt;Advance&lt;/th&gt;
+                    &lt;th class=&quot;text-end&quot;&gt;Advance %&lt;/th&gt;
+                    &lt;th&gt;Status&lt;/th&gt;
+                    &lt;th&gt;Placed (UTC)&lt;/th&gt;
+                    &lt;th&gt;Message&lt;/th&gt;
+                    &lt;th&gt;&lt;/th&gt;
+                &lt;/tr&gt;
+            &lt;/thead&gt;
+            &lt;tbody&gt;
+                @if (Model.Orders.Count == 0)
+                {
+                    &lt;tr&gt;&lt;td colspan=&quot;10&quot; class=&quot;text-center text-muted py-4&quot;&gt;No orders match this filter.&lt;/td&gt;&lt;/tr&gt;
+                }
+                @foreach (var order in Model.Orders)
+                {
+                    &lt;tr&gt;
+                        &lt;td class=&quot;font-monospace&quot;&gt;@order.OrderNumber&lt;/td&gt;
+                        &lt;td&gt;@(order.Customer?.Name ?? &quot;-&quot;)&lt;/td&gt;
+                        &lt;td class=&quot;text-center&quot;&gt;@order.OrderDetails.Count&lt;/td&gt;
+                        &lt;td class=&quot;text-end&quot;&gt;@order.TotalAmount.ToString(&quot;N2&quot;)&lt;/td&gt;
+                        &lt;td class=&quot;text-end&quot;&gt;@order.AdvanceAmount.ToString(&quot;N2&quot;)&lt;/td&gt;
+                        &lt;td class=&quot;text-end @(order.AdvancePercentage &gt;= 50 ? &quot;text-success&quot; : &quot;text-danger&quot;)&quot;&gt;
+                            @order.AdvancePercentage.ToString(&quot;0.##&quot;)%
+                        &lt;/td&gt;
+                        &lt;td&gt;&lt;span class=&quot;badge bg-@BadgeFor(order.Status)&quot;&gt;@order.Status&lt;/span&gt;&lt;/td&gt;
+                        &lt;td class=&quot;small&quot;&gt;@order.OrderDate.ToString(&quot;yyyy-MM-dd HH:mm:ss&quot;)&lt;/td&gt;
+                        &lt;td class=&quot;small text-muted&quot;&gt;@order.StatusMessage&lt;/td&gt;
+                        &lt;td class=&quot;text-end&quot;&gt;
+                            &lt;a class=&quot;btn btn-sm btn-outline-primary&quot; asp-action=&quot;Details&quot; asp-route-id=&quot;@order.Id&quot;&gt;View&lt;/a&gt;
+                        &lt;/td&gt;
+                    &lt;/tr&gt;
+                }
+            &lt;/tbody&gt;
+        &lt;/table&gt;
+    &lt;/div&gt;
+&lt;/div&gt;
+
+&lt;p class=&quot;small text-muted mt-3&quot;&gt;
+    An order moves Received &amp;rarr; Queued &amp;rarr; Processing &amp;rarr; Accepted or Rejected.
+    Refresh after a second or two to see the background worker finish.
+&lt;/p&gt;</code></pre>
+
+
+<h3 id="step31">Step 31: Create Views\Orders\Details.cshtml</h3>
+<p>A single order, pulling the lines and the advance from SQL Server and the decision from
+PostgreSQL. This is the one screen that shows both databases side by side, which makes the split
+easy to explain.</p>
+<pre class="code" data-lang="cshtml"><code>@model Order
+@{
+    ViewData[&quot;Title&quot;] = $&quot;Order {Model.OrderNumber}&quot;;
+    var processed = ViewBag.Processed as ProcessedOrder;
+
+    string BadgeFor(OrderStatus s) =&gt; s switch
+    {
+        OrderStatus.Received =&gt; &quot;secondary&quot;,
+        OrderStatus.Queued =&gt; &quot;info&quot;,
+        OrderStatus.Processing =&gt; &quot;primary&quot;,
+        OrderStatus.Accepted =&gt; &quot;success&quot;,
+        OrderStatus.Rejected =&gt; &quot;danger&quot;,
+        _ =&gt; &quot;dark&quot;
+    };
+}
+
+&lt;div class=&quot;d-flex justify-content-between align-items-center mb-3&quot;&gt;
+    &lt;h1 class=&quot;h3 mb-0&quot;&gt;
+        Order &lt;span class=&quot;font-monospace&quot;&gt;@Model.OrderNumber&lt;/span&gt;
+        &lt;span class=&quot;badge bg-@BadgeFor(Model.Status) align-middle&quot;&gt;@Model.Status&lt;/span&gt;
+    &lt;/h1&gt;
+    &lt;a class=&quot;btn btn-sm btn-outline-secondary&quot; asp-action=&quot;Status&quot;&gt;Back to status&lt;/a&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;row g-4&quot;&gt;
+    &lt;div class=&quot;col-12 col-lg-7&quot;&gt;
+        &lt;div class=&quot;card&quot;&gt;
+            &lt;div class=&quot;card-header fw-semibold&quot;&gt;Order Lines &lt;span class=&quot;text-muted small&quot;&gt;(SQL Server)&lt;/span&gt;&lt;/div&gt;
+            &lt;div class=&quot;table-responsive&quot;&gt;
+                &lt;table class=&quot;table mb-0&quot;&gt;
+                    &lt;thead&gt;
+                        &lt;tr&gt;
+                            &lt;th&gt;Product&lt;/th&gt;
+                            &lt;th&gt;SKU&lt;/th&gt;
+                            &lt;th class=&quot;text-center&quot;&gt;Qty&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;Unit Price&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;Line Total&lt;/th&gt;
+                        &lt;/tr&gt;
+                    &lt;/thead&gt;
+                    &lt;tbody&gt;
+                        @foreach (var d in Model.OrderDetails)
+                        {
+                            &lt;tr&gt;
+                                &lt;td&gt;@(d.Product?.Name ?? &quot;-&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;font-monospace small&quot;&gt;@(d.Product?.Sku ?? &quot;-&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;text-center&quot;&gt;@d.Quantity&lt;/td&gt;
+                                &lt;td class=&quot;text-end&quot;&gt;@d.UnitPrice.ToString(&quot;N2&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;text-end&quot;&gt;@d.LineTotal.ToString(&quot;N2&quot;)&lt;/td&gt;
+                            &lt;/tr&gt;
+                        }
+                    &lt;/tbody&gt;
+                    &lt;tfoot class=&quot;table-light&quot;&gt;
+                        &lt;tr&gt;
+                            &lt;th colspan=&quot;4&quot; class=&quot;text-end&quot;&gt;Order Total&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;@Model.TotalAmount.ToString(&quot;N2&quot;)&lt;/th&gt;
+                        &lt;/tr&gt;
+                    &lt;/tfoot&gt;
+                &lt;/table&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+    &lt;/div&gt;
+
+    &lt;div class=&quot;col-12 col-lg-5&quot;&gt;
+        &lt;div class=&quot;card mb-3&quot;&gt;
+            &lt;div class=&quot;card-header fw-semibold&quot;&gt;Customer&lt;/div&gt;
+            &lt;div class=&quot;card-body&quot;&gt;
+                &lt;dl class=&quot;row mb-0&quot;&gt;
+                    &lt;dt class=&quot;col-4&quot;&gt;Name&lt;/dt&gt;&lt;dd class=&quot;col-8&quot;&gt;@(Model.Customer?.Name ?? &quot;-&quot;)&lt;/dd&gt;
+                    &lt;dt class=&quot;col-4&quot;&gt;Email&lt;/dt&gt;&lt;dd class=&quot;col-8&quot;&gt;@(Model.Customer?.Email ?? &quot;-&quot;)&lt;/dd&gt;
+                    &lt;dt class=&quot;col-4&quot;&gt;Phone&lt;/dt&gt;&lt;dd class=&quot;col-8&quot;&gt;@(Model.Customer?.Phone ?? &quot;-&quot;)&lt;/dd&gt;
+                    &lt;dt class=&quot;col-4&quot;&gt;City&lt;/dt&gt;&lt;dd class=&quot;col-8&quot;&gt;@(Model.Customer?.City ?? &quot;-&quot;)&lt;/dd&gt;
+                &lt;/dl&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+
+        &lt;div class=&quot;card mb-3&quot;&gt;
+            &lt;div class=&quot;card-header fw-semibold&quot;&gt;Advance&lt;/div&gt;
+            &lt;div class=&quot;card-body&quot;&gt;
+                &lt;dl class=&quot;row mb-2&quot;&gt;
+                    &lt;dt class=&quot;col-6&quot;&gt;Total&lt;/dt&gt;&lt;dd class=&quot;col-6 text-end&quot;&gt;@Model.TotalAmount.ToString(&quot;N2&quot;)&lt;/dd&gt;
+                    &lt;dt class=&quot;col-6&quot;&gt;Advance Paid&lt;/dt&gt;&lt;dd class=&quot;col-6 text-end&quot;&gt;@Model.AdvanceAmount.ToString(&quot;N2&quot;)&lt;/dd&gt;
+                    &lt;dt class=&quot;col-6&quot;&gt;Advance %&lt;/dt&gt;
+                    &lt;dd class=&quot;col-6 text-end @(Model.AdvancePercentage &gt;= 50 ? &quot;text-success&quot; : &quot;text-danger&quot;)&quot;&gt;
+                        @Model.AdvancePercentage.ToString(&quot;0.##&quot;)%
+                    &lt;/dd&gt;
+                &lt;/dl&gt;
+                &lt;div class=&quot;progress&quot; style=&quot;height:1.25rem&quot;&gt;
+                    &lt;div class=&quot;progress-bar @(Model.AdvancePercentage &gt;= 50 ? &quot;bg-success&quot; : &quot;bg-danger&quot;)&quot;
+                         role=&quot;progressbar&quot;
+                         style=&quot;width:@(Math.Min(Model.AdvancePercentage, 100m).ToString(&quot;0.##&quot;, System.Globalization.CultureInfo.InvariantCulture))%&quot;&gt;
+                        @Model.AdvancePercentage.ToString(&quot;0&quot;)%
+                    &lt;/div&gt;
+                &lt;/div&gt;
+                @if (!string.IsNullOrWhiteSpace(Model.StatusMessage))
+                {
+                    &lt;p class=&quot;small text-muted mt-3 mb-0&quot;&gt;@Model.StatusMessage&lt;/p&gt;
+                }
+            &lt;/div&gt;
+        &lt;/div&gt;
+
+        &lt;div class=&quot;card&quot;&gt;
+            &lt;div class=&quot;card-header fw-semibold&quot;&gt;Processing Outcome &lt;span class=&quot;text-muted small&quot;&gt;(PostgreSQL)&lt;/span&gt;&lt;/div&gt;
+            &lt;div class=&quot;card-body&quot;&gt;
+                @if (processed is null)
+                {
+                    &lt;p class=&quot;text-muted mb-0&quot;&gt;
+                        Not processed yet, or PostgreSQL is unreachable. Refresh in a moment.
+                    &lt;/p&gt;
+                }
+                else
+                {
+                    &lt;dl class=&quot;row mb-0&quot;&gt;
+                        &lt;dt class=&quot;col-5&quot;&gt;Decision&lt;/dt&gt;
+                        &lt;dd class=&quot;col-7&quot;&gt;
+                            &lt;span class=&quot;badge bg-@(processed.IsAccepted ? &quot;success&quot; : &quot;danger&quot;)&quot;&gt;@processed.Decision&lt;/span&gt;
+                        &lt;/dd&gt;
+                        &lt;dt class=&quot;col-5&quot;&gt;Reason&lt;/dt&gt;&lt;dd class=&quot;col-7 small&quot;&gt;@processed.Reason&lt;/dd&gt;
+                        &lt;dt class=&quot;col-5&quot;&gt;Processed (UTC)&lt;/dt&gt;
+                        &lt;dd class=&quot;col-7 small&quot;&gt;@processed.ProcessedOnUtc.ToString(&quot;yyyy-MM-dd HH:mm:ss&quot;)&lt;/dd&gt;
+                        &lt;dt class=&quot;col-5&quot;&gt;Duration&lt;/dt&gt;&lt;dd class=&quot;col-7 small&quot;&gt;@processed.ProcessingDurationMs ms&lt;/dd&gt;
+                    &lt;/dl&gt;
+                }
+            &lt;/div&gt;
+        &lt;/div&gt;
+    &lt;/div&gt;
+&lt;/div&gt;</code></pre>
+
+
+<h3 id="step32">Step 32: Create Views\Orders\Processed.cshtml</h3>
+<p>The Viewing Processed Orders screen, reading the <code>processed_orders</code> table from
+PostgreSQL. It shows the decision, the reason text written by the worker and how long processing
+took, plus summary tiles including the acceptance rate.</p>
+<pre class="code" data-lang="cshtml"><code>@model ProcessedOrdersViewModel
+@{
+    ViewData[&quot;Title&quot;] = &quot;Processed Orders&quot;;
+}
+
+&lt;div class=&quot;d-flex justify-content-between align-items-center mb-3&quot;&gt;
+    &lt;h1 class=&quot;h3 mb-0&quot;&gt;Processed Orders &lt;span class=&quot;text-muted fs-6&quot;&gt;(PostgreSQL)&lt;/span&gt;&lt;/h1&gt;
+    &lt;a class=&quot;btn btn-sm btn-outline-secondary&quot; asp-action=&quot;Processed&quot;&gt;Refresh&lt;/a&gt;
+&lt;/div&gt;
+
+@if (Model.DataError is not null)
+{
+    &lt;div class=&quot;alert alert-danger&quot;&gt;
+        &lt;strong&gt;PostgreSQL could not be read.&lt;/strong&gt;
+        &lt;div class=&quot;small mt-1&quot;&gt;@Model.DataError&lt;/div&gt;
+        &lt;div class=&quot;small mt-1&quot;&gt;Check &lt;a href=&quot;/health&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;/health&lt;/a&gt; for the current state.&lt;/div&gt;
+    &lt;/div&gt;
+}
+
+&lt;div class=&quot;row g-3 mb-4&quot;&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;
+        &lt;div class=&quot;card text-bg-success h-100&quot;&gt;&lt;div class=&quot;card-body&quot;&gt;
+            &lt;div class=&quot;small text-uppercase&quot;&gt;Accepted&lt;/div&gt;
+            &lt;div class=&quot;fs-3&quot;&gt;@Model.AcceptedCount&lt;/div&gt;
+            &lt;div class=&quot;small&quot;&gt;@Model.AcceptedValue.ToString(&quot;N2&quot;) value&lt;/div&gt;
+        &lt;/div&gt;&lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;
+        &lt;div class=&quot;card text-bg-danger h-100&quot;&gt;&lt;div class=&quot;card-body&quot;&gt;
+            &lt;div class=&quot;small text-uppercase&quot;&gt;Rejected&lt;/div&gt;
+            &lt;div class=&quot;fs-3&quot;&gt;@Model.RejectedCount&lt;/div&gt;
+            &lt;div class=&quot;small&quot;&gt;@Model.RejectedValue.ToString(&quot;N2&quot;) value&lt;/div&gt;
+        &lt;/div&gt;&lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;
+        &lt;div class=&quot;card h-100&quot;&gt;&lt;div class=&quot;card-body&quot;&gt;
+            &lt;div class=&quot;small text-uppercase text-muted&quot;&gt;Total Processed&lt;/div&gt;
+            &lt;div class=&quot;fs-3&quot;&gt;@(Model.AcceptedCount + Model.RejectedCount)&lt;/div&gt;
+        &lt;/div&gt;&lt;/div&gt;
+    &lt;/div&gt;
+    &lt;div class=&quot;col-6 col-lg-3&quot;&gt;
+        &lt;div class=&quot;card h-100&quot;&gt;&lt;div class=&quot;card-body&quot;&gt;
+            &lt;div class=&quot;small text-uppercase text-muted&quot;&gt;Acceptance Rate&lt;/div&gt;
+            &lt;div class=&quot;fs-3&quot;&gt;
+                @{
+                    var totalDecided = Model.AcceptedCount + Model.RejectedCount;
+                    var rate = totalDecided == 0 ? 0m : (decimal)Model.AcceptedCount / totalDecided * 100m;
+                }
+                @rate.ToString(&quot;0.#&quot;)%
+            &lt;/div&gt;
+        &lt;/div&gt;&lt;/div&gt;
+    &lt;/div&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;card&quot;&gt;
+    &lt;div class=&quot;card-header fw-semibold&quot;&gt;processed_orders&lt;/div&gt;
+    &lt;div class=&quot;table-responsive&quot;&gt;
+        &lt;table class=&quot;table table-striped table-hover mb-0 align-middle&quot;&gt;
+            &lt;thead&gt;
+                &lt;tr&gt;
+                    &lt;th&gt;Order #&lt;/th&gt;
+                    &lt;th&gt;Customer&lt;/th&gt;
+                    &lt;th class=&quot;text-center&quot;&gt;Items&lt;/th&gt;
+                    &lt;th class=&quot;text-end&quot;&gt;Total&lt;/th&gt;
+                    &lt;th class=&quot;text-end&quot;&gt;Advance&lt;/th&gt;
+                    &lt;th class=&quot;text-end&quot;&gt;Advance %&lt;/th&gt;
+                    &lt;th&gt;Decision&lt;/th&gt;
+                    &lt;th&gt;Reason&lt;/th&gt;
+                    &lt;th&gt;Processed (UTC)&lt;/th&gt;
+                    &lt;th class=&quot;text-end&quot;&gt;Took&lt;/th&gt;
+                &lt;/tr&gt;
+            &lt;/thead&gt;
+            &lt;tbody&gt;
+                @if (Model.ProcessedOrders.Count == 0)
+                {
+                    &lt;tr&gt;
+                        &lt;td colspan=&quot;10&quot; class=&quot;text-center text-muted py-4&quot;&gt;
+                            Nothing has been processed yet. Create an order and give the worker a moment.
+                        &lt;/td&gt;
+                    &lt;/tr&gt;
+                }
+                @foreach (var p in Model.ProcessedOrders)
+                {
+                    &lt;tr&gt;
+                        &lt;td class=&quot;font-monospace&quot;&gt;
+                            &lt;a asp-action=&quot;Details&quot; asp-route-id=&quot;@p.OrderId&quot;&gt;@p.OrderNumber&lt;/a&gt;
+                        &lt;/td&gt;
+                        &lt;td&gt;@p.CustomerName&lt;/td&gt;
+                        &lt;td class=&quot;text-center&quot;&gt;@p.ItemCount&lt;/td&gt;
+                        &lt;td class=&quot;text-end&quot;&gt;@p.TotalAmount.ToString(&quot;N2&quot;)&lt;/td&gt;
+                        &lt;td class=&quot;text-end&quot;&gt;@p.AdvanceAmount.ToString(&quot;N2&quot;)&lt;/td&gt;
+                        &lt;td class=&quot;text-end @(p.IsAccepted ? &quot;text-success&quot; : &quot;text-danger&quot;)&quot;&gt;
+                            @p.AdvancePercentage.ToString(&quot;0.##&quot;)%
+                        &lt;/td&gt;
+                        &lt;td&gt;&lt;span class=&quot;badge bg-@(p.IsAccepted ? &quot;success&quot; : &quot;danger&quot;)&quot;&gt;@p.Decision&lt;/span&gt;&lt;/td&gt;
+                        &lt;td class=&quot;small text-muted&quot;&gt;@p.Reason&lt;/td&gt;
+                        &lt;td class=&quot;small&quot;&gt;@p.ProcessedOnUtc.ToString(&quot;yyyy-MM-dd HH:mm:ss&quot;)&lt;/td&gt;
+                        &lt;td class=&quot;text-end small&quot;&gt;@p.ProcessingDurationMs ms&lt;/td&gt;
+                    &lt;/tr&gt;
+                }
+            &lt;/tbody&gt;
+        &lt;/table&gt;
+    &lt;/div&gt;
+&lt;/div&gt;</code></pre>
+
+
+<h3 id="step33">Step 33: Create Views\Orders\Decisions.cshtml</h3>
+<p>The Viewing Accepted and Rejected Orders screen. With no filter it shows both panels side by
+side; with a filter it shows one. The repeated table markup is factored into a local
+<code>RenderPanel</code> function so both panels stay identical.</p>
+<pre class="code" data-lang="cshtml"><code>@model ProcessedOrdersViewModel
+@{
+    ViewData[&quot;Title&quot;] = &quot;Accepted and Rejected Orders&quot;;
+    var accepted = Model.ProcessedOrders.Where(p =&gt; p.IsAccepted).ToList();
+    var rejected = Model.ProcessedOrders.Where(p =&gt; !p.IsAccepted).ToList();
+}
+
+&lt;div class=&quot;d-flex justify-content-between align-items-center mb-3&quot;&gt;
+    &lt;h1 class=&quot;h3 mb-0&quot;&gt;Accepted and Rejected Orders&lt;/h1&gt;
+    &lt;a class=&quot;btn btn-sm btn-outline-secondary&quot; asp-action=&quot;Decisions&quot; asp-route-decision=&quot;@Model.Decision&quot;&gt;Refresh&lt;/a&gt;
+&lt;/div&gt;
+
+@if (Model.DataError is not null)
+{
+    &lt;div class=&quot;alert alert-danger&quot;&gt;
+        &lt;strong&gt;PostgreSQL could not be read.&lt;/strong&gt;
+        &lt;div class=&quot;small mt-1&quot;&gt;@Model.DataError&lt;/div&gt;
+    &lt;/div&gt;
+}
+
+&lt;div class=&quot;mb-3&quot;&gt;
+    &lt;a class=&quot;btn btn-sm @(Model.Decision is null ? &quot;btn-dark&quot; : &quot;btn-outline-dark&quot;)&quot;
+       asp-action=&quot;Decisions&quot;&gt;All (@(Model.AcceptedCount + Model.RejectedCount))&lt;/a&gt;
+    &lt;a class=&quot;btn btn-sm @(Model.Decision == &quot;Accepted&quot; ? &quot;btn-success&quot; : &quot;btn-outline-success&quot;)&quot;
+       asp-action=&quot;Decisions&quot; asp-route-decision=&quot;Accepted&quot;&gt;Accepted (@Model.AcceptedCount)&lt;/a&gt;
+    &lt;a class=&quot;btn btn-sm @(Model.Decision == &quot;Rejected&quot; ? &quot;btn-danger&quot; : &quot;btn-outline-danger&quot;)&quot;
+       asp-action=&quot;Decisions&quot; asp-route-decision=&quot;Rejected&quot;&gt;Rejected (@Model.RejectedCount)&lt;/a&gt;
+&lt;/div&gt;
+
+&lt;div class=&quot;alert alert-light border small&quot;&gt;
+    Rule applied by the background service: an order is &lt;strong&gt;Accepted&lt;/strong&gt; when the advance
+    is at least &lt;strong&gt;50%&lt;/strong&gt; of the order total, otherwise it is &lt;strong&gt;Rejected&lt;/strong&gt;.
+&lt;/div&gt;
+
+@{
+    // Local helper so both panels render identically.
+    async Task RenderPanel(string title, string colour, IReadOnlyList&lt;ProcessedOrder&gt; rows, decimal value)
+    {
+        &lt;div class=&quot;card h-100&quot;&gt;
+            &lt;div class=&quot;card-header d-flex justify-content-between align-items-center&quot;&gt;
+                &lt;span class=&quot;fw-semibold text-@colour&quot;&gt;@title&lt;/span&gt;
+                &lt;span class=&quot;badge bg-@colour&quot;&gt;@rows.Count &amp;middot; @value.ToString(&quot;N2&quot;)&lt;/span&gt;
+            &lt;/div&gt;
+            &lt;div class=&quot;table-responsive&quot;&gt;
+                &lt;table class=&quot;table table-sm table-striped mb-0 align-middle&quot;&gt;
+                    &lt;thead&gt;
+                        &lt;tr&gt;
+                            &lt;th&gt;Order #&lt;/th&gt;
+                            &lt;th&gt;Customer&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;Total&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;Advance&lt;/th&gt;
+                            &lt;th class=&quot;text-end&quot;&gt;%&lt;/th&gt;
+                            &lt;th&gt;Processed (UTC)&lt;/th&gt;
+                        &lt;/tr&gt;
+                    &lt;/thead&gt;
+                    &lt;tbody&gt;
+                        @if (rows.Count == 0)
+                        {
+                            &lt;tr&gt;&lt;td colspan=&quot;6&quot; class=&quot;text-center text-muted py-3&quot;&gt;None.&lt;/td&gt;&lt;/tr&gt;
+                        }
+                        @foreach (var p in rows)
+                        {
+                            &lt;tr&gt;
+                                &lt;td class=&quot;font-monospace&quot;&gt;
+                                    &lt;a asp-action=&quot;Details&quot; asp-route-id=&quot;@p.OrderId&quot;&gt;@p.OrderNumber&lt;/a&gt;
+                                &lt;/td&gt;
+                                &lt;td&gt;@p.CustomerName&lt;/td&gt;
+                                &lt;td class=&quot;text-end&quot;&gt;@p.TotalAmount.ToString(&quot;N2&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;text-end&quot;&gt;@p.AdvanceAmount.ToString(&quot;N2&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;text-end text-@colour&quot;&gt;@p.AdvancePercentage.ToString(&quot;0.##&quot;)&lt;/td&gt;
+                                &lt;td class=&quot;small&quot;&gt;@p.ProcessedOnUtc.ToString(&quot;yyyy-MM-dd HH:mm:ss&quot;)&lt;/td&gt;
+                            &lt;/tr&gt;
+                        }
+                    &lt;/tbody&gt;
+                &lt;/table&gt;
+            &lt;/div&gt;
+        &lt;/div&gt;
+        await Task.CompletedTask;
+    }
+}
+
+&lt;div class=&quot;row g-4&quot;&gt;
+    @if (Model.Decision is null or &quot;Accepted&quot;)
+    {
+        &lt;div class=&quot;col-12 @(Model.Decision is null ? &quot;col-xl-6&quot; : &quot;&quot;)&quot;&gt;
+            @{ await RenderPanel(&quot;Accepted&quot;, &quot;success&quot;, accepted, accepted.Sum(p =&gt; p.TotalAmount)); }
+        &lt;/div&gt;
+    }
+    @if (Model.Decision is null or &quot;Rejected&quot;)
+    {
+        &lt;div class=&quot;col-12 @(Model.Decision is null ? &quot;col-xl-6&quot; : &quot;&quot;)&quot;&gt;
+            @{ await RenderPanel(&quot;Rejected&quot;, &quot;danger&quot;, rejected, rejected.Sum(p =&gt; p.TotalAmount)); }
+        &lt;/div&gt;
+    }
+&lt;/div&gt;</code></pre>
+
+
+
+<h3 id="step34">Step 34: Update appsettings.json</h3>
+
+<p>Every connection string and every tunable lives here. This is the complete file:</p>
+
+<pre class="code" data-lang="json"><code>{
+  &quot;Logging&quot;: {
+    &quot;LogLevel&quot;: {
+      &quot;Default&quot;: &quot;Information&quot;,
+      &quot;Microsoft.AspNetCore&quot;: &quot;Warning&quot;,
+      &quot;Microsoft.EntityFrameworkCore.Database.Command&quot;: &quot;Warning&quot;,
+      &quot;MVC_HealthCheck&quot;: &quot;Information&quot;
+    }
+  },
+  &quot;AllowedHosts&quot;: &quot;*&quot;,
+
+  &quot;ConnectionStrings&quot;: {
+    &quot;SqlServer&quot;: &quot;Server=.;Database=OrderProcessingDb;Trusted_Connection=True;TrustServerCertificate=True;MultipleActiveResultSets=True&quot;,
+    &quot;PostgreSql&quot;: &quot;Host=localhost;Port=5432;Database=orderprocessing;Username=postgres;Password=YOUR_POSTGRES_PASSWORD&quot;,
+    &quot;Redis&quot;: &quot;localhost:6379&quot;
+  },
+
+  &quot;RabbitMq&quot;: {
+    &quot;HostName&quot;: &quot;localhost&quot;,
+    &quot;Port&quot;: 5672,
+    &quot;UserName&quot;: &quot;guest&quot;,
+    &quot;Password&quot;: &quot;guest&quot;,
+    &quot;VirtualHost&quot;: &quot;/&quot;,
+    &quot;QueueName&quot;: &quot;order-processing-queue&quot;
+  },
+
+  &quot;OrderProcessing&quot;: {
+    &quot;MinimumAdvancePercentage&quot;: 50,
+    &quot;SimulatedWorkMilliseconds&quot;: 750,
+    &quot;CacheListLength&quot;: 50
+  },
+
+  &quot;HealthChecksUI&quot;: {
+    &quot;EvaluationTimeInSeconds&quot;: 15,
+    &quot;MinimumSecondsBetweenFailureNotifications&quot;: 60
+  }
+}</code></pre>
+
+<p>Taking the changes one section at a time.</p>
+
+<h4>Logging</h4>
+
+<p>Two entries were added to the template's defaults.
+<code>Microsoft.EntityFrameworkCore.Database.Command</code> is set to <code>Warning</code>,
+which suppresses the SQL statement that EF Core logs at <code>Information</code> for every single
+query. Without it, the worker's output is unreadable.
+<code>MVC_HealthCheck</code> is set to <code>Information</code> so the application's own
+logging, including the line the worker writes for each decision, still comes through.</p>
+
+<h4>ConnectionStrings</h4>
+
+<p>Three named entries, read in <code>Program.cs</code> through
+<code>GetConnectionString</code>.</p>
+
+<p><code>SqlServer</code> uses <code>Server=.</code> for the local default instance and
+<code>Trusted_Connection=True</code> for Windows authentication, so no credentials appear in the
+file. <code>TrustServerCertificate=True</code> is needed because recent versions of
+<code>Microsoft.Data.SqlClient</code> encrypt by default and a local developer instance normally
+has a self signed certificate. It is a development convenience and should not follow you to
+production, where the right answer is a certificate the client actually trusts.</p>
+
+<p><code>PostgreSql</code> is a standard Npgsql connection string. Unlike SQL Server, a default
+PostgreSQL installation uses password authentication (<code>scram-sha-256</code>), so a password
+is unavoidable here. Do not commit it. Move it to user secrets for development
+(<code>dotnet user-secrets set "ConnectionStrings:PostgreSql" "..."</code>) or to an environment
+variable, both of which override this file without changing any code.</p>
+
+<p><code>Redis</code> is just <code>host:port</code>, the format
+<code>StackExchange.Redis</code> parses. It accepts a longer configuration string if you need a
+password or multiple endpoints.</p>
+
+<h4>RabbitMq</h4>
+
+<p>A new section bound to <code>RabbitMqOptions</code>. It matches the credentials and ports from
+the <code>docker run</code> command above. <code>QueueName</code> is here rather than hard coded
+because the publisher and the consumer both read it, and they must agree.</p>
+
+<h4>OrderProcessing</h4>
+
+<p>A new section bound to <code>OrderProcessingOptions</code>, holding the business rule itself.
+<code>MinimumAdvancePercentage</code> is 50, which is the threshold in the brief. Putting it in
+configuration means the rule can be changed without a rebuild, and it means the test for the rule
+can set it to something else.</p>
+
+<h4>HealthChecksUI</h4>
+
+<p>Settings for the dashboard. Note that the values set in code through
+<code>AddHealthChecksUI(settings =&gt; ...)</code> take effect regardless; this section is the
+configuration based equivalent, and the two can be mixed.</p>
+
+<h3 id="step35">Step 35: Wire everything in Program.cs</h3>
+
+<p>The composition root. Everything built so far is registered here, the health checks are
+declared, and the endpoints are mapped.</p>
+
+<pre class="code" data-lang="csharp"><code>using HealthChecks.UI.Client;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using MVC_HealthCheck.Data;
+using MVC_HealthCheck.HealthChecks;
+using MVC_HealthCheck.Messaging;
+using MVC_HealthCheck.Options;
+using MVC_HealthCheck.Services;
+using StackExchange.Redis;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// ---------------------------------------------------------------------------- configuration --
+
+builder.Services.Configure&lt;RabbitMqOptions&gt;(
+    builder.Configuration.GetSection(RabbitMqOptions.SectionName));
+builder.Services.Configure&lt;OrderProcessingOptions&gt;(
+    builder.Configuration.GetSection(OrderProcessingOptions.SectionName));
+
+var sqlServerConnection = builder.Configuration.GetConnectionString(&quot;SqlServer&quot;)
+    ?? throw new InvalidOperationException(&quot;ConnectionStrings:SqlServer is not configured.&quot;);
+var postgresConnection = builder.Configuration.GetConnectionString(&quot;PostgreSql&quot;)
+    ?? throw new InvalidOperationException(&quot;ConnectionStrings:PostgreSql is not configured.&quot;);
+var redisConnection = builder.Configuration.GetConnectionString(&quot;Redis&quot;)
+    ?? throw new InvalidOperationException(&quot;ConnectionStrings:Redis is not configured.&quot;);
+
+// ---------------------------------------------------------------------------------- storage --
+
+// SQL Server holds Customers, Products, Orders and OrderDetails.
+builder.Services.AddDbContext&lt;OrdersDbContext&gt;(options =&gt;
+    options.UseSqlServer(sqlServerConnection, sql =&gt; sql.EnableRetryOnFailure()));
+
+// PostgreSQL holds the processed_orders outcome table.
+builder.Services.AddDbContext&lt;ProcessedOrdersDbContext&gt;(options =&gt;
+    options.UseNpgsql(postgresConnection, npg =&gt; npg.EnableRetryOnFailure()));
+
+// A single multiplexer for the whole app. AbortOnConnectFail=false means a Redis outage at
+// startup does not stop the app from booting; it shows up on /health instead.
+builder.Services.AddSingleton&lt;IConnectionMultiplexer&gt;(_ =&gt;
+{
+    var config = ConfigurationOptions.Parse(redisConnection);
+    config.AbortOnConnectFail = false;
+    config.ConnectRetry = 3;
+    config.ClientName = &quot;mvc-healthcheck-order-processing&quot;;
+    return ConnectionMultiplexer.Connect(config);
+});
+
+builder.Services.AddSingleton&lt;IOrderCache, RedisOrderCache&gt;();
+
+// ---------------------------------------------------------------------------------- messaging --
+
+builder.Services.AddSingleton&lt;RabbitMqConnectionProvider&gt;();
+builder.Services.AddSingleton&lt;IOrderPublisher, RabbitMqOrderPublisher&gt;();
+builder.Services.AddHostedService&lt;OrderProcessingWorker&gt;();
+
+// ---------------------------------------------------------------------------------- app services --
+
+builder.Services.AddScoped&lt;OrderService&gt;();
+builder.Services.AddScoped&lt;ProcessedOrderService&gt;();
+
+// ------------------------------------------------------------------------------- health checks --
+// AspNetCore.Diagnostics.HealthChecks (Xabaril) probes for every external dependency.
+
+builder.Services.AddHealthChecks()
+    .AddSqlServer(
+        connectionString: sqlServerConnection,
+        healthQuery: &quot;SELECT 1;&quot;,
+        name: &quot;sql-server&quot;,
+        failureStatus: HealthStatus.Unhealthy,
+        tags: [&quot;db&quot;, &quot;sql&quot;, &quot;sqlserver&quot;, &quot;ready&quot;])
+
+    .AddNpgSql(
+        connectionString: postgresConnection,
+        healthQuery: &quot;SELECT 1;&quot;,
+        name: &quot;postgresql&quot;,
+        failureStatus: HealthStatus.Unhealthy,
+        tags: [&quot;db&quot;, &quot;sql&quot;, &quot;postgres&quot;, &quot;ready&quot;])
+
+    .AddRedis(
+        connectionMultiplexerFactory: sp =&gt; sp.GetRequiredService&lt;IConnectionMultiplexer&gt;(),
+        name: &quot;redis&quot;,
+        failureStatus: HealthStatus.Degraded,
+        tags: [&quot;cache&quot;, &quot;redis&quot;, &quot;ready&quot;])
+
+    // The async overload: the factory runs on every probe, so the provider gets a chance to
+    // re-establish a dropped connection instead of reporting a stale failure forever.
+    .AddRabbitMQ(
+        factory: sp =&gt; sp.GetRequiredService&lt;RabbitMqConnectionProvider&gt;().GetConnectionAsync(),
+        name: &quot;rabbitmq&quot;,
+        failureStatus: HealthStatus.Unhealthy,
+        tags: [&quot;broker&quot;, &quot;rabbitmq&quot;, &quot;ready&quot;]);
+
+// The polling UI that ships with the same library.
+builder.Services
+    .AddHealthChecksUI(settings =&gt;
+    {
+        settings.SetEvaluationTimeInSeconds(15);
+        settings.MaximumHistoryEntriesPerEndpoint(60);
+        settings.SetApiMaxActiveRequests(1);
+        // Must point at the UI-formatted payload, not the custom /health JSON.
+        settings.AddHealthCheckEndpoint(&quot;Order Processing&quot;, &quot;/health/ui-data&quot;);
+    })
+    .AddInMemoryStorage();
+
+// ---------------------------------------------------------------------------------------- mvc --
+
+builder.Services.AddControllersWithViews();
+
+var app = builder.Build();
+
+if (!app.Environment.IsDevelopment())
+{
+    app.UseExceptionHandler(&quot;/Home/Error&quot;);
+    app.UseHsts();
+}
+
+app.UseStaticFiles();
+app.UseRouting();
+app.UseAuthorization();
+
+app.MapStaticAssets();
+
+// ------------------------------------------------------------------------- health endpoints --
+
+// Everything, with the detailed JSON body.
+app.MapHealthChecks(&quot;/health&quot;, new HealthCheckOptions
+{
+    ResponseWriter = HealthCheckResponseWriter.WriteAsync
+});
+
+// Readiness: all external dependencies must answer before traffic is routed here.
+app.MapHealthChecks(&quot;/health/ready&quot;, new HealthCheckOptions
+{
+    Predicate = registration =&gt; registration.Tags.Contains(&quot;ready&quot;),
+    ResponseWriter = HealthCheckResponseWriter.WriteAsync
+});
+
+// Liveness: is the process up at all? No dependency is probed.
+app.MapHealthChecks(&quot;/health/live&quot;, new HealthCheckOptions
+{
+    Predicate = _ =&gt; false
+});
+
+// The shape the HealthChecks UI polls for.
+app.MapHealthChecks(&quot;/health/ui-data&quot;, new HealthCheckOptions
+{
+    Predicate = _ =&gt; true,
+    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
+});
+
+app.MapHealthChecksUI(options =&gt; options.UIPath = &quot;/health-ui&quot;);
+
+// ---------------------------------------------------------------------------------- routing --
+
+app.MapControllerRoute(
+    name: &quot;default&quot;,
+    pattern: &quot;{controller=Home}/{action=Index}/{id?}&quot;)
+    .WithStaticAssets();
+
+// Create both schemas and seed the catalogue. Failures are logged, not thrown, so a database
+// outage surfaces on /health rather than preventing startup.
+await DatabaseInitializer.InitializeAsync(app.Services);
+
+app.Run();</code></pre>
+
+<p>Reading it in order: configuration binding, then the three storage registrations, then
+messaging, then application services, then health checks, then MVC. After
+<code>builder.Build()</code> the pipeline is configured, the health endpoints are mapped, the
+default MVC route is registered, and the databases are initialised just before
+<code>app.Run()</code>.</p>
+
+<p>Two registration details are worth pulling out. The Redis multiplexer is a singleton created
+with <code>AbortOnConnectFail = false</code>. That single flag is why the application starts when
+Redis is down: the default behaviour is to throw from <code>Connect</code>, which would take the
+whole process with it before the health endpoint ever existed.
+<code>RabbitMqConnectionProvider</code> is a singleton for the opposite reason, because a broker
+connection is expensive and must be shared rather than created per request.</p>
+
+<h2>5. AddHealthChecks() in detail</h2>
+
+<p>This is the part of <code>Program.cs</code> that does the actual work:</p>
+
+<pre class="code" data-lang="csharp"><code>builder.Services.AddHealthChecks()
+    .AddSqlServer(
+        connectionString: sqlServerConnection,
+        healthQuery: &quot;SELECT 1;&quot;,
+        name: &quot;sql-server&quot;,
+        failureStatus: HealthStatus.Unhealthy,
+        tags: [&quot;db&quot;, &quot;sql&quot;, &quot;sqlserver&quot;, &quot;ready&quot;])
+
+    .AddNpgSql(
+        connectionString: postgresConnection,
+        healthQuery: &quot;SELECT 1;&quot;,
+        name: &quot;postgresql&quot;,
+        failureStatus: HealthStatus.Unhealthy,
+        tags: [&quot;db&quot;, &quot;sql&quot;, &quot;postgres&quot;, &quot;ready&quot;])
+
+    .AddRedis(
+        connectionMultiplexerFactory: sp =&gt; sp.GetRequiredService&lt;IConnectionMultiplexer&gt;(),
+        name: &quot;redis&quot;,
+        failureStatus: HealthStatus.Degraded,
+        tags: [&quot;cache&quot;, &quot;redis&quot;, &quot;ready&quot;])
+
+    .AddRabbitMQ(
+        factory: sp =&gt; sp.GetRequiredService&lt;RabbitMqConnectionProvider&gt;().GetConnectionAsync(),
+        name: &quot;rabbitmq&quot;,
+        failureStatus: HealthStatus.Unhealthy,
+        tags: [&quot;broker&quot;, &quot;rabbitmq&quot;, &quot;ready&quot;]);</code></pre>
+
+<p><code>AddHealthChecks()</code> registers the health check infrastructure (most importantly
+<code>HealthCheckService</code>) and returns an <code>IHealthChecksBuilder</code>. Every
+<code>Add*</code> call after it adds one <code>HealthCheckRegistration</code> and returns the
+builder again, which is why they chain. Calling <code>AddHealthChecks()</code> twice is harmless;
+you get the same builder back and the registrations accumulate.</p>
+
+<h4>The parameters, and why each value was chosen</h4>
+
+<p><strong><code>name</code></strong> is the key this check appears under in
+<code>HealthReport.Entries</code>, and therefore the name a human reads at two in the morning.
+Each package has a default (<code>"sqlserver"</code>, <code>"rabbitmq"</code> and so on), but
+naming them explicitly matters as soon as you have two of anything, for example a primary and a
+reporting database. Names must be unique.</p>
+
+<p><strong><code>healthQuery</code></strong> is the SQL the probe executes.
+<code>SELECT 1;</code> is the right choice: it proves the connection opened, authentication
+succeeded and the server is answering queries, and it costs essentially nothing. Resist the urge
+to probe a real table. If you want to prove a specific table is reachable, a bounded
+<code>SELECT TOP 1</code> against a small table is the most you should consider.</p>
+
+<p><strong><code>failureStatus</code></strong> is the status reported when the probe throws, and
+this is the parameter that carries the most design intent. SQL Server, PostgreSQL and RabbitMQ
+are set to <code>Unhealthy</code>, because without any of them the application cannot accept or
+process an order. Redis is set to <code>Degraded</code>, because Redis in this application holds
+only activity lists and counters. Orders are still captured, still queued, still processed and
+still stored when Redis is down; the dashboard just goes quiet. Since <code>Degraded</code> maps
+to a 200 by default, a Redis outage will not cause a load balancer to pull the instance out of
+rotation, which is exactly right. That one argument encodes the judgement that Redis is a
+convenience and PostgreSQL is not.</p>
+
+<p><strong><code>tags</code></strong> are free form labels used to filter checks per endpoint.
+Every check here carries <code>ready</code>, which is what the readiness endpoint selects on. The
+others (<code>db</code>, <code>cache</code>, <code>broker</code>) are not used by this
+application's endpoints but cost nothing and make it trivial to add, say, a database only
+endpoint later.</p>
+
+<p><strong><code>timeout</code></strong> is not used above but is worth knowing. Each
+<code>Add*</code> method accepts an optional <code>TimeSpan</code> after which the check is
+abandoned and reported as failed. Without it, a probe against a host that is dropping packets
+rather than refusing connections can hang for the full connection timeout, and your health
+endpoint becomes slow at exactly the moment it is being polled hardest.</p>
+
+<h4>Why Redis and RabbitMQ use factories instead of connection strings</h4>
+
+<p>SQL Server and PostgreSQL take a connection string, because opening a short lived connection
+per probe is normal for those clients and they pool underneath.</p>
+
+<p>Redis does not work that way. <code>ConnectionMultiplexer</code> is expensive and designed to
+be created once and shared for the lifetime of the application. Passing a connection string to
+<code>AddRedis</code> would have the health check build its own multiplexer alongside the one the
+application already uses, so the probe would be testing a connection that no application code
+actually depends on. Passing
+<code>connectionMultiplexerFactory: sp =&gt; sp.GetRequiredService&lt;IConnectionMultiplexer&gt;()</code>
+means the probe tests the real one.</p>
+
+<p>RabbitMQ in version 9 of the package takes the same approach, and only the factory form
+exists: there is no connection string overload. Two overloads are available, one taking
+<code>Func&lt;IServiceProvider, IConnection&gt;</code> and one taking
+<code>Func&lt;IServiceProvider, Task&lt;IConnection&gt;&gt;</code>. This application uses the
+asynchronous one, because <code>RabbitMQ.Client</code> 7 creates connections asynchronously and
+the alternative is blocking on a task inside the probe.</p>
+
+<p>The factory runs on every probe, not once at startup. That is the detail that makes recovery
+work. Because each call goes through <code>RabbitMqConnectionProvider.GetConnectionAsync</code>,
+which checks <code>IsOpen</code> and rebuilds a dead connection, restarting the broker produces a
+few failed probes and then a clean recovery. Had the connection been resolved once and cached,
+the check would have reported a failure that could never clear without an application
+restart.</p>
+
+<h4>Mapping the endpoints</h4>
+
+<pre class="code" data-lang="csharp"><code>app.MapHealthChecks(&quot;/health&quot;, new HealthCheckOptions
+{
+    ResponseWriter = HealthCheckResponseWriter.WriteAsync
+});
+
+app.MapHealthChecks(&quot;/health/ready&quot;, new HealthCheckOptions
+{
+    Predicate = registration =&gt; registration.Tags.Contains(&quot;ready&quot;),
+    ResponseWriter = HealthCheckResponseWriter.WriteAsync
+});
+
+app.MapHealthChecks(&quot;/health/live&quot;, new HealthCheckOptions
+{
+    Predicate = _ =&gt; false
+});
+
+app.MapHealthChecks(&quot;/health/ui-data&quot;, new HealthCheckOptions
+{
+    Predicate = _ =&gt; true,
+    ResponseWriter = UIResponseWriter.WriteHealthCheckUIResponse
+});
+
+app.MapHealthChecksUI(options =&gt; options.UIPath = &quot;/health-ui&quot;);</code></pre>
+
+<p>One set of registered checks, four endpoints over it, differing only by
+<code>Predicate</code> and <code>ResponseWriter</code>.</p>
+
+<p><code>/health</code> runs everything (the default predicate selects all checks) and writes the
+detailed JSON. <code>/health/ready</code> filters to checks tagged <code>ready</code>, which is
+the readiness probe: it fails when a dependency the application needs is unavailable.</p>
+
+<p><code>/health/live</code> is the liveness probe, and <code>Predicate = _ =&gt; false</code>
+deserves an explanation because it looks like a mistake. It selects no checks at all. The
+endpoint therefore returns 200 with an empty report whenever the process is able to serve a
+request. That is precisely what liveness should mean. If liveness probed the database, a
+temporary database outage would cause Kubernetes to kill and restart every pod, repeatedly,
+which converts a recoverable dependency problem into a full outage. Liveness answers "should I
+restart this process", and the answer to that is almost never yes because another system is
+down.</p>
+
+<p><code>/health/ui-data</code> exists because the dashboard cannot read our custom JSON. It
+runs the same checks but writes <code>UIResponseWriter.WriteHealthCheckUIResponse</code>, the
+format the UI expects. The UI is pointed at it in <code>AddHealthChecksUI</code>:</p>
+
+<pre class="code" data-lang="csharp"><code>builder.Services
+    .AddHealthChecksUI(settings =&gt;
+    {
+        settings.SetEvaluationTimeInSeconds(15);
+        settings.MaximumHistoryEntriesPerEndpoint(60);
+        settings.SetApiMaxActiveRequests(1);
+        settings.AddHealthCheckEndpoint(&quot;Order Processing&quot;, &quot;/health/ui-data&quot;);
+    })
+    .AddInMemoryStorage();</code></pre>
+
+<p>The UI polls that endpoint every 15 seconds and keeps 60 results per endpoint, giving roughly
+fifteen minutes of history. <code>AddInMemoryStorage()</code> keeps that history in memory, so it
+is lost on restart. For anything beyond local development use one of the persistent storage
+packages, such as the SQL Server or PostgreSQL storage providers.</p>
+
+<p>If you point the UI at <code>/health</code> by mistake, the dashboard renders but shows the
+endpoint as unhealthy with a deserialisation error, because our custom JSON is not the shape it
+parses. That is an easy half hour to lose.</p>
+
+<h4>Status codes</h4>
+
+<p>By default <code>Healthy</code> and <code>Degraded</code> both map to 200, and
+<code>Unhealthy</code> maps to 503. Override it per endpoint through
+<code>ResultStatusCodes</code> when you need different behaviour:</p>
+
+<pre class="code" data-lang="csharp"><code>app.MapHealthChecks(&quot;/health/strict&quot;, new HealthCheckOptions
+{
+    ResultStatusCodes =
+    {
+        [HealthStatus.Healthy]   = StatusCodes.Status200OK,
+        [HealthStatus.Degraded]  = StatusCodes.Status503ServiceUnavailable,
+        [HealthStatus.Unhealthy] = StatusCodes.Status503ServiceUnavailable
+    }
+});</code></pre>
+
+<h2>6. The complete execution, end to end</h2>
+
+<p>Here is what actually happens when somebody places an order, from the button click to the row
+in PostgreSQL.</p>
+
+<h4>Capture, inside the HTTP request</h4>
+
+<p><strong>1.</strong> The browser posts to <code>/Orders/Create</code> with a customer id, a set
+of product ids and quantities, and an advance amount. Note what is not posted: no prices and no
+total.</p>
+
+<p><strong>2.</strong> <code>OrdersController.Create</code> validates the model and calls
+<code>OrderService.CreateOrderAsync</code>. The service groups duplicate product lines, loads
+those products from the catalogue, and computes each line total and the order total from the
+database prices. This is the step that makes the total trustworthy, and the decision depends
+entirely on the total.</p>
+
+<p><strong>3.</strong> The order and its lines are inserted into SQL Server with status
+<code>Received</code>. At this point the order is durable. Everything after this can fail without
+losing it.</p>
+
+<p><strong>4.</strong> The order is pushed onto the Redis <code>orders:list:received</code> list
+and the received counter is incremented. If Redis is unreachable this silently does nothing.</p>
+
+<p><strong>5.</strong> The message is published to RabbitMQ on the default exchange with the
+queue name as the routing key, marked persistent, on a durable queue. On success the order moves
+to <code>Queued</code>. On failure the order moves to <code>Failed</code> with the broker error
+recorded in its status message, and the user is told. The HTTP request ends here and the user is
+redirected to the status screen, typically well before processing finishes.</p>
+
+<h4>Processing, in the background service</h4>
+
+<p><strong>6.</strong> <code>OrderProcessingWorker</code> has been consuming the queue since
+startup with <code>autoAck: false</code> and a prefetch of 1. It receives the delivery,
+deserialises the message, opens a DI scope, and sets the order to <code>Processing</code> in SQL
+Server.</p>
+
+<p><strong>The rule.</strong> The worker computes
+<code>AdvanceAmount / TotalAmount * 100</code>, rounded to two decimal places, guarding against a
+zero total. If that percentage is greater than or equal to
+<code>MinimumAdvancePercentage</code>, the order is accepted; otherwise it is rejected. The
+comparison is inclusive, so an advance of exactly 50% is accepted.</p>
+
+<p><strong>7.</strong> A row is written to <code>processed_orders</code> in PostgreSQL carrying
+the decision, the computed percentage, a human readable reason and how long processing took. If a
+row for this order already exists, because the message was redelivered, it is updated instead of
+duplicated.</p>
+
+<p><strong>8.</strong> The order in SQL Server is updated to <code>Accepted</code> or
+<code>Rejected</code>, with the reason text and the processing timestamp.</p>
+
+<p><strong>9.</strong> The result is pushed onto the Redis <code>orders:list:processed</code>
+list and the processed counter plus the accepted or rejected counter are incremented.</p>
+
+<p><strong>10.</strong> The message is acknowledged with <code>BasicAckAsync</code> and leaves
+the queue. If anything in steps 6 to 9 threw, the handler instead marks the order
+<code>Failed</code> and calls <code>BasicNackAsync</code> with <code>requeue: false</code>, so
+the message is discarded rather than looping.</p>
+
+<h4>Reading it back</h4>
+
+<p><strong>11.</strong> Three different screens read from three different places. Order Status
+reads SQL Server, so it shows every order including ones still in flight and ones that failed.
+Processed Orders and Accepted/Rejected read PostgreSQL, so they show only orders that reached a
+decision. The dashboard reads Redis, so it shows recent activity and running counters.</p>
+
+<p>Reading the same order from all three is the clearest way to see why the split exists. SQL
+Server answers "what did the customer order and where is it now". PostgreSQL answers "what did we
+decide and why". Redis answers "what has been happening lately".</p>
+
+<h4>What the health checks are doing meanwhile</h4>
+
+<p>Independently of all of the above, every request to a health endpoint runs the selected probes
+concurrently and aggregates them. A worked example of the output, with PostgreSQL deliberately
+misconfigured, shows why the custom writer earns its place:</p>
+
+<pre class="code" data-lang="json"><code>{
+  &quot;status&quot;: &quot;Unhealthy&quot;,
+  &quot;totalDurationMs&quot;: 619.22,
+  &quot;checkedAtUtc&quot;: &quot;2026-10-06T05:24:07.5901759Z&quot;,
+  &quot;entries&quot;: [
+    { &quot;name&quot;: &quot;sql-server&quot;, &quot;status&quot;: &quot;Healthy&quot;,   &quot;durationMs&quot;: 1.62,   &quot;tags&quot;: [ &quot;db&quot;, &quot;sql&quot;, &quot;sqlserver&quot;, &quot;ready&quot; ] },
+    { &quot;name&quot;: &quot;postgresql&quot;, &quot;status&quot;: &quot;Unhealthy&quot;, &quot;durationMs&quot;: 610.79, &quot;tags&quot;: [ &quot;db&quot;, &quot;sql&quot;, &quot;postgres&quot;, &quot;ready&quot; ],
+      &quot;description&quot;: &quot;28P01: password authentication failed for user \&quot;postgres\&quot;&quot;,
+      &quot;error&quot;:       &quot;28P01: password authentication failed for user \&quot;postgres\&quot;&quot; },
+    { &quot;name&quot;: &quot;redis&quot;,      &quot;status&quot;: &quot;Healthy&quot;,   &quot;durationMs&quot;: 3.22,   &quot;tags&quot;: [ &quot;cache&quot;, &quot;redis&quot;, &quot;ready&quot; ] },
+    { &quot;name&quot;: &quot;rabbitmq&quot;,   &quot;status&quot;: &quot;Healthy&quot;,   &quot;durationMs&quot;: 6.63,   &quot;tags&quot;: [ &quot;broker&quot;, &quot;rabbitmq&quot;, &quot;ready&quot; ] }
+  ]
+}</code></pre>
+
+<p>That response names the broken dependency, gives the exact driver error, and shows that the
+failing probe took 610 ms while the healthy ones took single digit milliseconds. The default
+plain text body would have said <code>Unhealthy</code>. The endpoint returns 503 here because one
+entry is unhealthy; with all four healthy it returns 200.</p>
+
+<p>It is worth watching the application degrade on purpose, because that is the only way to know
+the checks work. Stop Redis with <code>docker stop hc-redis</code> and the report goes to
+<code>Degraded</code> and still returns 200, the dashboard counters go to zero, and orders
+continue to be captured and processed normally. Stop RabbitMQ and the report goes to
+<code>Unhealthy</code> with a 503, new orders are saved to SQL Server but marked
+<code>Failed</code> because they cannot be queued. Start either one again and the checks recover
+on their own within a probe or two.</p>
+
+<h2>7. Conclusion</h2>
+
+<p>Adding health checks to an ASP.NET Core application is a few lines of code. Adding health
+checks that tell you something useful takes a little more thought, and most of that thought goes
+into three decisions.</p>
+
+<p>The first is what each dependency is worth. The <code>failureStatus</code> argument is where
+that judgement lives. Marking Redis <code>Degraded</code> while SQL Server, PostgreSQL and
+RabbitMQ are <code>Unhealthy</code> is a statement that this application can serve its purpose
+without a cache but not without its databases or its broker. Get this wrong in the cautious
+direction and a cache blip pulls healthy instances out of rotation.</p>
+
+<p>The second is separating liveness from readiness. They answer different questions, and
+conflating them is actively harmful: a liveness probe that checks the database will restart your
+pods during a database incident and turn a brief outage into a long one.</p>
+
+<p>The third is what the endpoint says when it fails. The default body is a single word. Twenty
+lines of response writer turn it into a document that names the failing dependency and quotes the
+driver error, which is the difference between diagnosing an incident and guessing at it.</p>
+
+<p>The order processing pipeline here exists to make those decisions concrete. Four dependencies
+that fail in different ways, with different consequences, is a far better teacher than a single
+database and a green tick. Build it, then start stopping containers and watching what the
+endpoint says. The checks you trust are the ones you have watched fail.</p>
+
+</body>
+</html>

@@ -1,0 +1,126 @@
+@model Order
+@{
+    ViewData["Title"] = $"Order {Model.OrderNumber}";
+    var processed = ViewBag.Processed as ProcessedOrder;
+
+    string BadgeFor(OrderStatus s) => s switch
+    {
+        OrderStatus.Received => "secondary",
+        OrderStatus.Queued => "info",
+        OrderStatus.Processing => "primary",
+        OrderStatus.Accepted => "success",
+        OrderStatus.Rejected => "danger",
+        _ => "dark"
+    };
+}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h1 class="h3 mb-0">
+        Order <span class="font-monospace">@Model.OrderNumber</span>
+        <span class="badge bg-@BadgeFor(Model.Status) align-middle">@Model.Status</span>
+    </h1>
+    <a class="btn btn-sm btn-outline-secondary" asp-action="Status">Back to status</a>
+</div>
+
+<div class="row g-4">
+    <div class="col-12 col-lg-7">
+        <div class="card">
+            <div class="card-header fw-semibold">Order Lines <span class="text-muted small">(SQL Server)</span></div>
+            <div class="table-responsive">
+                <table class="table mb-0">
+                    <thead>
+                        <tr>
+                            <th>Product</th>
+                            <th>SKU</th>
+                            <th class="text-center">Qty</th>
+                            <th class="text-end">Unit Price</th>
+                            <th class="text-end">Line Total</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var d in Model.OrderDetails)
+                        {
+                            <tr>
+                                <td>@(d.Product?.Name ?? "-")</td>
+                                <td class="font-monospace small">@(d.Product?.Sku ?? "-")</td>
+                                <td class="text-center">@d.Quantity</td>
+                                <td class="text-end">@d.UnitPrice.ToString("N2")</td>
+                                <td class="text-end">@d.LineTotal.ToString("N2")</td>
+                            </tr>
+                        }
+                    </tbody>
+                    <tfoot class="table-light">
+                        <tr>
+                            <th colspan="4" class="text-end">Order Total</th>
+                            <th class="text-end">@Model.TotalAmount.ToString("N2")</th>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-12 col-lg-5">
+        <div class="card mb-3">
+            <div class="card-header fw-semibold">Customer</div>
+            <div class="card-body">
+                <dl class="row mb-0">
+                    <dt class="col-4">Name</dt><dd class="col-8">@(Model.Customer?.Name ?? "-")</dd>
+                    <dt class="col-4">Email</dt><dd class="col-8">@(Model.Customer?.Email ?? "-")</dd>
+                    <dt class="col-4">Phone</dt><dd class="col-8">@(Model.Customer?.Phone ?? "-")</dd>
+                    <dt class="col-4">City</dt><dd class="col-8">@(Model.Customer?.City ?? "-")</dd>
+                </dl>
+            </div>
+        </div>
+
+        <div class="card mb-3">
+            <div class="card-header fw-semibold">Advance</div>
+            <div class="card-body">
+                <dl class="row mb-2">
+                    <dt class="col-6">Total</dt><dd class="col-6 text-end">@Model.TotalAmount.ToString("N2")</dd>
+                    <dt class="col-6">Advance Paid</dt><dd class="col-6 text-end">@Model.AdvanceAmount.ToString("N2")</dd>
+                    <dt class="col-6">Advance %</dt>
+                    <dd class="col-6 text-end @(Model.AdvancePercentage >= 50 ? "text-success" : "text-danger")">
+                        @Model.AdvancePercentage.ToString("0.##")%
+                    </dd>
+                </dl>
+                <div class="progress" style="height:1.25rem">
+                    <div class="progress-bar @(Model.AdvancePercentage >= 50 ? "bg-success" : "bg-danger")"
+                         role="progressbar"
+                         style="width:@(Math.Min(Model.AdvancePercentage, 100m).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture))%">
+                        @Model.AdvancePercentage.ToString("0")%
+                    </div>
+                </div>
+                @if (!string.IsNullOrWhiteSpace(Model.StatusMessage))
+                {
+                    <p class="small text-muted mt-3 mb-0">@Model.StatusMessage</p>
+                }
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header fw-semibold">Processing Outcome <span class="text-muted small">(PostgreSQL)</span></div>
+            <div class="card-body">
+                @if (processed is null)
+                {
+                    <p class="text-muted mb-0">
+                        Not processed yet, or PostgreSQL is unreachable. Refresh in a moment.
+                    </p>
+                }
+                else
+                {
+                    <dl class="row mb-0">
+                        <dt class="col-5">Decision</dt>
+                        <dd class="col-7">
+                            <span class="badge bg-@(processed.IsAccepted ? "success" : "danger")">@processed.Decision</span>
+                        </dd>
+                        <dt class="col-5">Reason</dt><dd class="col-7 small">@processed.Reason</dd>
+                        <dt class="col-5">Processed (UTC)</dt>
+                        <dd class="col-7 small">@processed.ProcessedOnUtc.ToString("yyyy-MM-dd HH:mm:ss")</dd>
+                        <dt class="col-5">Duration</dt><dd class="col-7 small">@processed.ProcessingDurationMs ms</dd>
+                    </dl>
+                }
+            </div>
+        </div>
+    </div>
+</div>

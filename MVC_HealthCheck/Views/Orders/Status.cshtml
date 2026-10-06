@@ -1,0 +1,98 @@
+@model OrderStatusViewModel
+@{
+    ViewData["Title"] = "Order Status";
+
+    string BadgeFor(OrderStatus s) => s switch
+    {
+        OrderStatus.Received => "secondary",
+        OrderStatus.Queued => "info",
+        OrderStatus.Processing => "primary",
+        OrderStatus.Accepted => "success",
+        OrderStatus.Rejected => "danger",
+        _ => "dark"
+    };
+
+    var statuses = Enum.GetValues<OrderStatus>();
+}
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h1 class="h3 mb-0">Order Status <span class="text-muted fs-6">(SQL Server)</span></h1>
+    <div>
+        <a class="btn btn-sm btn-outline-secondary" asp-action="Status" asp-route-status="@Model.Filter">Refresh</a>
+        <a class="btn btn-sm btn-primary" asp-action="Create">Create Order</a>
+    </div>
+</div>
+
+<div class="mb-3">
+    <a class="btn btn-sm @(Model.Filter is null ? "btn-dark" : "btn-outline-dark")" asp-action="Status">
+        All (@Model.Orders.Count)
+    </a>
+    @foreach (var s in statuses)
+    {
+        <a class="btn btn-sm @(Model.Filter == s ? "btn-" + BadgeFor(s) : "btn-outline-" + BadgeFor(s))"
+           asp-action="Status" asp-route-status="@s">@s</a>
+    }
+</div>
+
+@if (!Model.CacheAvailable)
+{
+    <div class="alert alert-warning py-2 small">Redis is not reachable, so the counters below read zero.</div>
+}
+
+<div class="row g-3 mb-4">
+    <div class="col-6 col-lg-3"><div class="border rounded p-2"><div class="small text-muted">Received</div><div class="fs-4">@Model.Counters.Received</div></div></div>
+    <div class="col-6 col-lg-3"><div class="border rounded p-2"><div class="small text-muted">Processed</div><div class="fs-4">@Model.Counters.Processed</div></div></div>
+    <div class="col-6 col-lg-3"><div class="border rounded p-2"><div class="small text-muted">Accepted</div><div class="fs-4 text-success">@Model.Counters.Accepted</div></div></div>
+    <div class="col-6 col-lg-3"><div class="border rounded p-2"><div class="small text-muted">Rejected</div><div class="fs-4 text-danger">@Model.Counters.Rejected</div></div></div>
+</div>
+
+<div class="card">
+    <div class="table-responsive">
+        <table class="table table-striped table-hover mb-0 align-middle">
+            <thead>
+                <tr>
+                    <th>Order #</th>
+                    <th>Customer</th>
+                    <th class="text-center">Items</th>
+                    <th class="text-end">Total</th>
+                    <th class="text-end">Advance</th>
+                    <th class="text-end">Advance %</th>
+                    <th>Status</th>
+                    <th>Placed (UTC)</th>
+                    <th>Message</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                @if (Model.Orders.Count == 0)
+                {
+                    <tr><td colspan="10" class="text-center text-muted py-4">No orders match this filter.</td></tr>
+                }
+                @foreach (var order in Model.Orders)
+                {
+                    <tr>
+                        <td class="font-monospace">@order.OrderNumber</td>
+                        <td>@(order.Customer?.Name ?? "-")</td>
+                        <td class="text-center">@order.OrderDetails.Count</td>
+                        <td class="text-end">@order.TotalAmount.ToString("N2")</td>
+                        <td class="text-end">@order.AdvanceAmount.ToString("N2")</td>
+                        <td class="text-end @(order.AdvancePercentage >= 50 ? "text-success" : "text-danger")">
+                            @order.AdvancePercentage.ToString("0.##")%
+                        </td>
+                        <td><span class="badge bg-@BadgeFor(order.Status)">@order.Status</span></td>
+                        <td class="small">@order.OrderDate.ToString("yyyy-MM-dd HH:mm:ss")</td>
+                        <td class="small text-muted">@order.StatusMessage</td>
+                        <td class="text-end">
+                            <a class="btn btn-sm btn-outline-primary" asp-action="Details" asp-route-id="@order.Id">View</a>
+                        </td>
+                    </tr>
+                }
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<p class="small text-muted mt-3">
+    An order moves Received &rarr; Queued &rarr; Processing &rarr; Accepted or Rejected.
+    Refresh after a second or two to see the background worker finish.
+</p>
